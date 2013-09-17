@@ -1931,6 +1931,28 @@ void smp_spurious_interrupt(struct pt_regs *regs)
 	irq_exit();
 }
 
+void smp_posted_interrupt(struct pt_regs *regs)
+{
+	// check if we are in the guest or in the host	
+	if (pi_injected_vector != NULL) {
+		// if we are in the guest, handlle this
+		// interrupt as usual (will be converted later to
+		// a virtual interrupt according to the descriptor)
+		do_IRQ(regs);
+		return;
+	}
+	// we are in the host thus we need to notify
+	// the kvm handler. KVM will re-queue the
+	// the interrupt 
+	exit_idle();
+	irq_enter();
+	inc_irq_stat(irq_eli_count);
+	ack_APIC_irq();
+	irq_exit();
+	if (posted_interrupt_handler != NULL)
+		posted_interrupt_handler();
+}
+
 /*
  * This interrupt should never happen with our APIC/SMP architecture
  */

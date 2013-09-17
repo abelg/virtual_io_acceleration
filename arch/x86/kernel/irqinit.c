@@ -57,6 +57,9 @@ DEFINE_PER_CPU(vector_irq_t, vector_irq) = {
 };
 EXPORT_PER_CPU_SYMBOL(vector_irq);
 
+void (*posted_interrupt_handler)(void) = NULL;
+EXPORT_SYMBOL(posted_interrupt_handler);
+
 int vector_used_by_percpu_irq(unsigned int vector)
 {
 	int cpu;
@@ -178,6 +181,8 @@ static void __init apic_intr_init(void)
 	/* IPI vectors for APIC spurious and error interrupts */
 	alloc_intr_gate(SPURIOUS_APIC_VECTOR, spurious_interrupt);
 	alloc_intr_gate(ERROR_APIC_VECTOR, error_interrupt);
+
+	alloc_intr_gate(POSTED_INTERRUPT_VECTOR, posted_interrupt);
 
 	/* IRQ work interrupts: */
 # ifdef CONFIG_IRQ_WORK

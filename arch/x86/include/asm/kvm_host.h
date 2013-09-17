@@ -619,6 +619,7 @@ struct kvm_vcpu_stat {
 	u32 hypercalls;
 	u32 irq_injections;
 	u32 nmi_injections;
+	u32 elvis_injections;
 };
 
 struct x86_instruction_info;
