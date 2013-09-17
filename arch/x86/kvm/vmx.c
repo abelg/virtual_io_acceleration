@@ -46,6 +46,7 @@
 #include <asm/kexec.h>
 
 #include "trace.h"
+#include <asm/apic.h>
 
 #define __ex(x) __kvm_handle_fault_on_reboot(x)
 #define __ex_clear(x, reg) \
@@ -451,6 +452,10 @@ struct vcpu_vmx {
 		 * original IDT, so we can inject a virtual interrupt.
 		 */
 		bool inject_mode;
+		/* Temporary flag used to know if an exit was already handled
+		 * by ELI and does not need to be handled in the usual path.
+		 */
+		bool exit_handled;
 		/*
 		 * The guest and host use different vectors for the assigned
 		 * device interrupts. This field is used to remap the vectors
@@ -4553,6 +4558,12 @@ static int handle_exception(struct kvm_vcpu *vcpu)
 	u32 vect_info;
 	enum emulation_result er;
 
+	if (vmx->eli.exit_handled) {
+		/* This is an NP exception (caused by non-assigned interrupt)
+		 * already handled by ELI in eli_complete_interrupts() */
+		return 1;
+	}
+
 	vect_info = vmx->idt_vectoring_info;
 	intr_info = vmx->exit_intr_info;
 
@@ -4954,6 +4965,265 @@ static int handle_halt(struct kvm_vcpu *vcpu)
 	skip_emulated_instruction(vcpu);
 	return kvm_emulate_halt(vcpu);
 }
+/* Generate a software interrupt. Unfortunately, x86 does not have a generic
+ * interrupt instruction taking a register or memory operand - each interrupt
+ * has a different opcode. This is why the following code is so repetitive...
+ *
+ * NOTE: Unlike a normal device interrupt, a software interrupt will be
+ * handled immediatly because software interrupts cannot be masked by IF.
+ * Pros: higher interrupt generated later would not be processed before this one
+ * Cons: the kvm/linux flow for handling external interrupts is altered
+ * We can also use self IPIs instead of software interrupt:
+ *	ack_APIC_irq();
+ *	apic->send_IPI_self(intr);
+ * In this case, the
+ * handling will be deferred until the host enables interrupts.
+ * Pros: the kvm/linux handling flow is not altered. No repetitive code :-)
+ * Cons: higher interrupts generated after can be processed before this one.
+ */
+static inline int software_intr(int intr)
+{
+	switch (intr) {
+	case 32: asm volatile("int $32" : : : "memory"); break;
+	case 33: asm volatile("int $33" : : : "memory"); break;
+	case 34: asm volatile("int $34" : : : "memory"); break;
+	case 35: asm volatile("int $35" : : : "memory"); break;
+	case 36: asm volatile("int $36" : : : "memory"); break;
+	case 37: asm volatile("int $37" : : : "memory"); break;
+	case 38: asm volatile("int $38" : : : "memory"); break;
+	case 39: asm volatile("int $39" : : : "memory"); break;
+	case 40: asm volatile("int $40" : : : "memory"); break;
+	case 41: asm volatile("int $41" : : : "memory"); break;
+	case 42: asm volatile("int $42" : : : "memory"); break;
+	case 43: asm volatile("int $43" : : : "memory"); break;
+	case 44: asm volatile("int $44" : : : "memory"); break;
+	case 45: asm volatile("int $45" : : : "memory"); break;
+	case 46: asm volatile("int $46" : : : "memory"); break;
+	case 47: asm volatile("int $47" : : : "memory"); break;
+	case 48: asm volatile("int $48" : : : "memory"); break;
+	case 49: asm volatile("int $49" : : : "memory"); break;
+	case 50: asm volatile("int $50" : : : "memory"); break;
+	case 51: asm volatile("int $51" : : : "memory"); break;
+	case 52: asm volatile("int $52" : : : "memory"); break;
+	case 53: asm volatile("int $53" : : : "memory"); break;
+	case 54: asm volatile("int $54" : : : "memory"); break;
+	case 55: asm volatile("int $55" : : : "memory"); break;
+	case 56: asm volatile("int $56" : : : "memory"); break;
+	case 57: asm volatile("int $57" : : : "memory"); break;
+	case 58: asm volatile("int $58" : : : "memory"); break;
+	case 59: asm volatile("int $59" : : : "memory"); break;
+	case 60: asm volatile("int $60" : : : "memory"); break;
+	case 61: asm volatile("int $61" : : : "memory"); break;
+	case 62: asm volatile("int $62" : : : "memory"); break;
+	case 63: asm volatile("int $63" : : : "memory"); break;
+	case 64: asm volatile("int $64" : : : "memory"); break;
+	case 65: asm volatile("int $65" : : : "memory"); break;
+	case 66: asm volatile("int $66" : : : "memory"); break;
+	case 67: asm volatile("int $67" : : : "memory"); break;
+	case 68: asm volatile("int $68" : : : "memory"); break;
+	case 69: asm volatile("int $69" : : : "memory"); break;
+	case 70: asm volatile("int $70" : : : "memory"); break;
+	case 71: asm volatile("int $71" : : : "memory"); break;
+	case 72: asm volatile("int $72" : : : "memory"); break;
+	case 73: asm volatile("int $73" : : : "memory"); break;
+	case 74: asm volatile("int $74" : : : "memory"); break;
+	case 75: asm volatile("int $75" : : : "memory"); break;
+	case 76: asm volatile("int $76" : : : "memory"); break;
+	case 77: asm volatile("int $77" : : : "memory"); break;
+	case 78: asm volatile("int $78" : : : "memory"); break;
+	case 79: asm volatile("int $79" : : : "memory"); break;
+	case 80: asm volatile("int $80" : : : "memory"); break;
+	case 81: asm volatile("int $81" : : : "memory"); break;
+	case 82: asm volatile("int $82" : : : "memory"); break;
+	case 83: asm volatile("int $83" : : : "memory"); break;
+	case 84: asm volatile("int $84" : : : "memory"); break;
+	case 85: asm volatile("int $85" : : : "memory"); break;
+	case 86: asm volatile("int $86" : : : "memory"); break;
+	case 87: asm volatile("int $87" : : : "memory"); break;
+	case 88: asm volatile("int $88" : : : "memory"); break;
+	case 89: asm volatile("int $89" : : : "memory"); break;
+	case 90: asm volatile("int $90" : : : "memory"); break;
+	case 91: asm volatile("int $91" : : : "memory"); break;
+	case 92: asm volatile("int $92" : : : "memory"); break;
+	case 93: asm volatile("int $93" : : : "memory"); break;
+	case 94: asm volatile("int $94" : : : "memory"); break;
+	case 95: asm volatile("int $95" : : : "memory"); break;
+	case 96: asm volatile("int $96" : : : "memory"); break;
+	case 97: asm volatile("int $97" : : : "memory"); break;
+	case 98: asm volatile("int $98" : : : "memory"); break;
+	case 99: asm volatile("int $99" : : : "memory"); break;
+	case 100: asm volatile("int $100" : : : "memory"); break;
+	case 101: asm volatile("int $101" : : : "memory"); break;
+	case 102: asm volatile("int $102" : : : "memory"); break;
+	case 103: asm volatile("int $103" : : : "memory"); break;
+	case 104: asm volatile("int $104" : : : "memory"); break;
+	case 105: asm volatile("int $105" : : : "memory"); break;
+	case 106: asm volatile("int $106" : : : "memory"); break;
+	case 107: asm volatile("int $107" : : : "memory"); break;
+	case 108: asm volatile("int $108" : : : "memory"); break;
+	case 109: asm volatile("int $109" : : : "memory"); break;
+	case 110: asm volatile("int $110" : : : "memory"); break;
+	case 111: asm volatile("int $111" : : : "memory"); break;
+	case 112: asm volatile("int $112" : : : "memory"); break;
+	case 113: asm volatile("int $113" : : : "memory"); break;
+	case 114: asm volatile("int $114" : : : "memory"); break;
+	case 115: asm volatile("int $115" : : : "memory"); break;
+	case 116: asm volatile("int $116" : : : "memory"); break;
+	case 117: asm volatile("int $117" : : : "memory"); break;
+	case 118: asm volatile("int $118" : : : "memory"); break;
+	case 119: asm volatile("int $119" : : : "memory"); break;
+	case 120: asm volatile("int $120" : : : "memory"); break;
+	case 121: asm volatile("int $121" : : : "memory"); break;
+	case 122: asm volatile("int $122" : : : "memory"); break;
+	case 123: asm volatile("int $123" : : : "memory"); break;
+	case 124: asm volatile("int $124" : : : "memory"); break;
+	case 125: asm volatile("int $125" : : : "memory"); break;
+	case 126: asm volatile("int $126" : : : "memory"); break;
+	case 127: asm volatile("int $127" : : : "memory"); break;
+	case 128: asm volatile("int $128" : : : "memory"); break;
+	case 129: asm volatile("int $129" : : : "memory"); break;
+	case 130: asm volatile("int $130" : : : "memory"); break;
+	case 131: asm volatile("int $131" : : : "memory"); break;
+	case 132: asm volatile("int $132" : : : "memory"); break;
+	case 133: asm volatile("int $133" : : : "memory"); break;
+	case 134: asm volatile("int $134" : : : "memory"); break;
+	case 135: asm volatile("int $135" : : : "memory"); break;
+	case 136: asm volatile("int $136" : : : "memory"); break;
+	case 137: asm volatile("int $137" : : : "memory"); break;
+	case 138: asm volatile("int $138" : : : "memory"); break;
+	case 139: asm volatile("int $139" : : : "memory"); break;
+	case 140: asm volatile("int $140" : : : "memory"); break;
+	case 141: asm volatile("int $141" : : : "memory"); break;
+	case 142: asm volatile("int $142" : : : "memory"); break;
+	case 143: asm volatile("int $143" : : : "memory"); break;
+	case 144: asm volatile("int $144" : : : "memory"); break;
+	case 145: asm volatile("int $145" : : : "memory"); break;
+	case 146: asm volatile("int $146" : : : "memory"); break;
+	case 147: asm volatile("int $147" : : : "memory"); break;
+	case 148: asm volatile("int $148" : : : "memory"); break;
+	case 149: asm volatile("int $149" : : : "memory"); break;
+	case 150: asm volatile("int $150" : : : "memory"); break;
+	case 151: asm volatile("int $151" : : : "memory"); break;
+	case 152: asm volatile("int $152" : : : "memory"); break;
+	case 153: asm volatile("int $153" : : : "memory"); break;
+	case 154: asm volatile("int $154" : : : "memory"); break;
+	case 155: asm volatile("int $155" : : : "memory"); break;
+	case 156: asm volatile("int $156" : : : "memory"); break;
+	case 157: asm volatile("int $157" : : : "memory"); break;
+	case 158: asm volatile("int $158" : : : "memory"); break;
+	case 159: asm volatile("int $159" : : : "memory"); break;
+	case 160: asm volatile("int $160" : : : "memory"); break;
+	case 161: asm volatile("int $161" : : : "memory"); break;
+	case 162: asm volatile("int $162" : : : "memory"); break;
+	case 163: asm volatile("int $163" : : : "memory"); break;
+	case 164: asm volatile("int $164" : : : "memory"); break;
+	case 165: asm volatile("int $165" : : : "memory"); break;
+	case 166: asm volatile("int $166" : : : "memory"); break;
+	case 167: asm volatile("int $167" : : : "memory"); break;
+	case 168: asm volatile("int $168" : : : "memory"); break;
+	case 169: asm volatile("int $169" : : : "memory"); break;
+	case 170: asm volatile("int $170" : : : "memory"); break;
+	case 171: asm volatile("int $171" : : : "memory"); break;
+	case 172: asm volatile("int $172" : : : "memory"); break;
+	case 173: asm volatile("int $173" : : : "memory"); break;
+	case 174: asm volatile("int $174" : : : "memory"); break;
+	case 175: asm volatile("int $175" : : : "memory"); break;
+	case 176: asm volatile("int $176" : : : "memory"); break;
+	case 177: asm volatile("int $177" : : : "memory"); break;
+	case 178: asm volatile("int $178" : : : "memory"); break;
+	case 179: asm volatile("int $179" : : : "memory"); break;
+	case 180: asm volatile("int $180" : : : "memory"); break;
+	case 181: asm volatile("int $181" : : : "memory"); break;
+	case 182: asm volatile("int $182" : : : "memory"); break;
+	case 183: asm volatile("int $183" : : : "memory"); break;
+	case 184: asm volatile("int $184" : : : "memory"); break;
+	case 185: asm volatile("int $185" : : : "memory"); break;
+	case 186: asm volatile("int $186" : : : "memory"); break;
+	case 187: asm volatile("int $187" : : : "memory"); break;
+	case 188: asm volatile("int $188" : : : "memory"); break;
+	case 189: asm volatile("int $189" : : : "memory"); break;
+	case 190: asm volatile("int $190" : : : "memory"); break;
+	case 191: asm volatile("int $191" : : : "memory"); break;
+	case 192: asm volatile("int $192" : : : "memory"); break;
+	case 193: asm volatile("int $193" : : : "memory"); break;
+	case 194: asm volatile("int $194" : : : "memory"); break;
+	case 195: asm volatile("int $195" : : : "memory"); break;
+	case 196: asm volatile("int $196" : : : "memory"); break;
+	case 197: asm volatile("int $197" : : : "memory"); break;
+	case 198: asm volatile("int $198" : : : "memory"); break;
+	case 199: asm volatile("int $199" : : : "memory"); break;
+	case 200: asm volatile("int $200" : : : "memory"); break;
+	case 201: asm volatile("int $201" : : : "memory"); break;
+	case 202: asm volatile("int $202" : : : "memory"); break;
+	case 203: asm volatile("int $203" : : : "memory"); break;
+	case 204: asm volatile("int $204" : : : "memory"); break;
+	case 205: asm volatile("int $205" : : : "memory"); break;
+	case 206: asm volatile("int $206" : : : "memory"); break;
+	case 207: asm volatile("int $207" : : : "memory"); break;
+	case 208: asm volatile("int $208" : : : "memory"); break;
+	case 209: asm volatile("int $209" : : : "memory"); break;
+	case 210: asm volatile("int $210" : : : "memory"); break;
+	case 211: asm volatile("int $211" : : : "memory"); break;
+	case 212: asm volatile("int $212" : : : "memory"); break;
+	case 213: asm volatile("int $213" : : : "memory"); break;
+	case 214: asm volatile("int $214" : : : "memory"); break;
+	case 215: asm volatile("int $215" : : : "memory"); break;
+	case 216: asm volatile("int $216" : : : "memory"); break;
+	case 217: asm volatile("int $217" : : : "memory"); break;
+	case 218: asm volatile("int $218" : : : "memory"); break;
+	case 219: asm volatile("int $219" : : : "memory"); break;
+	case 220: asm volatile("int $220" : : : "memory"); break;
+	case 221: asm volatile("int $221" : : : "memory"); break;
+	case 222: asm volatile("int $222" : : : "memory"); break;
+	case 223: asm volatile("int $223" : : : "memory"); break;
+	case 224: asm volatile("int $224" : : : "memory"); break;
+	case 225: asm volatile("int $225" : : : "memory"); break;
+	case 226: asm volatile("int $226" : : : "memory"); break;
+	case 227: asm volatile("int $227" : : : "memory"); break;
+	case 228: asm volatile("int $228" : : : "memory"); break;
+	case 229: asm volatile("int $229" : : : "memory"); break;
+	case 230: asm volatile("int $230" : : : "memory"); break;
+	case 231: asm volatile("int $231" : : : "memory"); break;
+	case 232: asm volatile("int $232" : : : "memory"); break;
+	case 233: asm volatile("int $233" : : : "memory"); break;
+	case 234: asm volatile("int $234" : : : "memory"); break;
+	case 235: asm volatile("int $235" : : : "memory"); break;
+	case 236: asm volatile("int $236" : : : "memory"); break;
+	case 237: asm volatile("int $237" : : : "memory"); break;
+	case 238: asm volatile("int $238" : : : "memory"); break;
+	case 239: asm volatile("int $239" : : : "memory"); break;
+	case 240: asm volatile("int $240" : : : "memory"); break;
+	case 241: asm volatile("int $241" : : : "memory"); break;
+	case 242: asm volatile("int $242" : : : "memory"); break;
+	case 243: asm volatile("int $243" : : : "memory"); break;
+	case 244: asm volatile("int $244" : : : "memory"); break;
+	case 245: asm volatile("int $245" : : : "memory"); break;
+	case 246: asm volatile("int $246" : : : "memory"); break;
+	case 247: asm volatile("int $247" : : : "memory"); break;
+	case 248: asm volatile("int $248" : : : "memory"); break;
+	case 249: asm volatile("int $249" : : : "memory"); break;
+	case 250: asm volatile("int $250" : : : "memory"); break;
+	case 251: asm volatile("int $251" : : : "memory"); break;
+	case 252: asm volatile("int $252" : : : "memory"); break;
+	case 253: asm volatile("int $253" : : : "memory"); break;
+	case 254: asm volatile("int $254" : : : "memory"); break;
+	case 255: asm volatile("int $255" : : : "memory"); break;
+	default:
+		printk(KERN_ERR "kvm-eli %s : unexpected guest intr 0x%x\n",
+			__func__, (u32)intr);
+	}
+	return 0;
+}
+
+/* When ELI is enabled (not in inject mode) the VCPU runs using the
+   shadow IDT and phyisical interrupts not assigned to the guest
+   cause a EXIT_REASON_EXCEPTION_NMI (NP_EXCEPTION).
+   This function is used to convert the exception to a real
+   interrupt by executing a INT X instruction (software interrupt)
+*/
+static inline void recreate_intr(int intr) {
+	software_intr(intr);
+}
 
 /*
  * Copy entry number "guest_vector" from the guest IDT to entry number
@@ -5094,6 +5364,46 @@ static void eli_remap(struct vcpu_vmx *vmx) {
 					vmx->eli.remap_gv_to_hirq[i]);
 	}
 }
+static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
+	vmx->eli.exit_handled = false;
+
+	if (vmx->eli.enabled) {
+		/* vmx->idt_vectoring_info tells us whether this exit happened
+		 * while the processor was reading the guest IDT for delivering
+		 * a certain interrupt vector. In ELI, this usually happens
+		 * when a non-present IDT entry was found (this is the way ELI
+		 * forces an exit on interrupts not assigned to the guest).
+		 * But rarely it happens for other reasons, e.g., page-fault
+		 * reading the IDT. In any case, we need to deliver this
+		 * interrupt in the host; If this is an assigned interrupt,
+		 * and the exit unnecessary, KVM will inject it into the guest.
+		 */
+		u32 type = vmx->idt_vectoring_info & VECTORING_INFO_TYPE_MASK;
+		u32 vector = vmx->idt_vectoring_info & VECTORING_INFO_VECTOR_MASK;
+		bool valid = vmx->idt_vectoring_info & VECTORING_INFO_VALID_MASK;
+	        if (!vmx->eli.inject_mode && valid  && type == INTR_TYPE_EXT_INTR) {
+			recreate_intr(vector);
+			vmx->eli.exit_handled = true;
+			/* Note we do NOT acknowledge (ack_APIC_irq()) the
+			 * interrupt in this case, because Linux's interrupt
+			 * handler will do this when handling the interrupt we
+			 * rethrew it
+			 */
+			return 1;
+		}
+
+		/* Always acknowledge any pending interrupt that might have
+		 * been delivered during guest mode execution.
+		 * We could omit this and do it only for APIC accesses, but
+		 * this is risky for the host if the guest forgets to EOI
+		 * or crashes.
+		 */
+		ack_APIC_irq();
+	}
+		
+	return 0;
+}
+
 #define DI_INITIALIZE             300
 
 static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
@@ -6573,12 +6883,19 @@ static void vmx_complete_atomic_exit(struct vcpu_vmx *vmx)
 {
 	u32 exit_intr_info;
 
+	vmx->exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+	exit_intr_info = vmx->exit_intr_info;
+
+	/* handle ELI related exits */
+	if (eli_complete_interrupts(vmx, exit_intr_info)) {
+		vmx->idt_vectoring_info = 0;
+		return;
+	}
+
 	if (!(vmx->exit_reason == EXIT_REASON_MCE_DURING_VMENTRY
 	      || vmx->exit_reason == EXIT_REASON_EXCEPTION_NMI))
 		return;
 
-	vmx->exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
-	exit_intr_info = vmx->exit_intr_info;
 
 	/* Handle machine checks before interrupts are enabled */
 	if (is_machine_check(exit_intr_info))
