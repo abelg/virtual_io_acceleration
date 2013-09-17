@@ -477,6 +477,35 @@ struct vcpu_vmx {
 		int remap_gv_to_hirq[256];
 		int remap_gv_to_hv[256];
 	} eli;
+	struct {
+		/* Whether virtual interrupt injection via paravirtual
+		 * posted interrupts is enabled or not.
+		 */		
+		bool enabled;
+		/* Address of guest variable which the host will fill with the
+		 * vector used for paravirtual posted interrupts (the guest
+		 * cannot currently control this choice).
+		 */
+		gpa_t notif_vector_gpa;
+		/* Address of a guest page (must be page aligned) in which the
+		 * host writes the vector being injected for each vcpu (one
+		 * u32_t per vcpu).
+		 */
+		gpa_t injected_vector_gpa;
+		/* Host page of injected_vector_gpa, and pointer directly
+		 * to this vcpu's vector being injected
+		 */
+		struct page *shared_descriptor_page;
+		int *shared_descriptor;
+		/* Data corresponding to the last vector injected via PV PI.
+		 * Required in case the IPI arrives in root mode and the
+		 * vector needs to be re-injected.
+		 */
+		int injected_vector;
+		int injected_delivery_mode;
+		int injected_level;
+		int injected_trig_mode;
+	} posted_interrupts;
 };
 
 enum segment_cache_field {
