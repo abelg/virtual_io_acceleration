@@ -640,6 +640,8 @@ void kvm_vcpu_kick(struct kvm_vcpu *vcpu);
 
 int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
 			int vector, int level, int trig_mode);
+int kvm_resend_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode);
 
 int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
 			int vector, int level, int trig_mode);

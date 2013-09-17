@@ -5372,6 +5372,15 @@ static void eli_copy_idt_entry(struct vcpu_vmx *vmx,
 	}
 }
 
+/* Paravirtual posted interrupts send an IPI to the core running a certain
+ * guest, intending that it will be handled in this guest (without exit).
+ * However, in some rare cases an unrelated exit occurs, and the IPI arrives
+ * in this host. In this case, we need to remember for which guest (vcpu_vmx)
+ * the injection was intended to, so we can re-inject it.
+ */
+#define MAX_CPUS 128
+static struct vcpu_vmx *pvpi_vmxs[MAX_CPUS];
+
 /* eli_init initializes ELI (Exit-Less Interrupts) for this vcpu, by
  * remembering the given location (GVA) for the shadow IDT.
  * The contents (and size) of the shadow IDT will only be filled later,
@@ -8477,6 +8486,34 @@ static struct kvm_x86_ops vmx_x86_ops = {
 	.check_intercept = vmx_check_intercept,
 };
 
+/* Handler for paravirtual posted-interrupt notifications which are received
+ * in the host instead of the guest that was just running. We re-inject the
+ * same posted interrupt into the guest using KVM's normal injection.
+ */
+static void pvpi_host_intr(void) {
+	int cpu = raw_smp_processor_id();
+	struct vcpu_vmx *vmx = pvpi_vmxs[cpu];
+	if (!vmx) {
+		printk(KERN_WARNING  "kvm-eli: posted interrupt delivered to host but no vmx was found for processor %d", cpu);
+		return;
+	}		
+
+	kvm_resend_interrupt(&vmx->vcpu,
+				vmx->posted_interrupts.injected_delivery_mode,
+				vmx->posted_interrupts.injected_vector,
+				vmx->posted_interrupts.injected_level,
+				vmx->posted_interrupts.injected_trig_mode);
+        *(vmx->posted_interrupts.shared_descriptor) = -1;
+}
+static void pvpi_set_handler(void) {
+	posted_interrupt_handler = pvpi_host_intr;
+}
+
+static void pvpi_unset_handler(void) {
+	posted_interrupt_handler = NULL;
+}
+
+
 static int __init vmx_init(void)
 {
 	int r, i;
@@ -8547,6 +8584,7 @@ static int __init vmx_init(void)
 		kvm_enable_tdp();
 	} else
 		kvm_disable_tdp();
+	pvpi_set_handler();
 
 	return 0;
 
@@ -8561,6 +8599,7 @@ out:
 
 static void __exit vmx_exit(void)
 {
+	pvpi_unset_handler();
 	free_page((unsigned long)vmx_msr_bitmap_legacy);
 	free_page((unsigned long)vmx_msr_bitmap_longmode);
 	free_page((unsigned long)vmx_io_bitmap_b);
