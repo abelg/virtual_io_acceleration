@@ -143,6 +143,52 @@ struct vhost_virtqueue {
 	/* Reference counting for outstanding ubufs.
 	 * Protected by vq mutex. Writers must also take device mutex. */
 	struct vhost_ubuf_ref *ubufs;
+	struct {
+		/* When a virtqueue is in vqpoll.enabled mode, it declares
+		 * that instead of using guest notifications (kicks) to
+		 * discover new work, we prefer to continuously poll this
+		 * virtqueue in the worker thread.
+		 * If !enabled, the rest of the fields below are undefined.
+		 */
+		bool enabled;
+	 	/* vqpoll.enabled doesn't always mean that this virtqueue is
+		 * actually being polled: The backend (e.g., net.c) may
+		 * temporarily disable it using vhost_disable/enable_notify().
+		 * vqpoll.link is used to maintain the thread's round-robin
+		 * list of virtqueus that actually need to be polled.
+		 * Note list_empty(link) means this virtqueue isn't polled.
+		 */
+		struct list_head link;
+		/* If this flag is true, the virtqueue is being shut down,
+		 * so vqpoll should not be re-enabled.
+		 */
+		bool shutdown;
+		/* Various counters used to decide when to enter polling mode
+		 * or leave it and return to notification mode.
+		 */
+		unsigned long jiffies_last_kick;
+		unsigned long jiffies_last_work;
+		int work_this_jiffy;
+#if 1 /* patcholi vhost-can-continue */
+		/* how many items were pending the last time we checked if it was stuck */
+		u32 last_pending_items;
+		
+		/* TSC  when we detected for the first time the queue was stuck
+		   Used to measure how many cycles the queue has been stuck
+		 */
+		u64 stuck_cycles;
+#endif
+		/* virtqueue.avail is a userspace pointer, and each vhost
+		 * device may have a different process context, so polling
+		 * different vhost devices could involve page-table switches
+		 * (and associated TLB flushes), which hurts performance when
+		 * adding nearly-idle guests. So instead, we pin these pages
+		 * in memory and keep a kernel-mapped pointer to each, so
+		 * polling becomes simple memory reads.
+		 */
+		struct page *avail_page;
+		volatile struct vring_avail *avail_mapped;
+	} vqpoll;
 };
 
 struct vhost_dev {
@@ -170,6 +216,7 @@ struct vhost_worker {
 	int id;
 	/* linked workers list */
 	struct list_head node;
+	struct list_head vqpoll_list;
 };
 
 struct vhost_workers_pool {

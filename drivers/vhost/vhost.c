@@ -26,6 +26,7 @@
 #include <linux/slab.h>
 #include <linux/kthread.h>
 #include <linux/cgroup.h>
+#include <linux/jiffies.h>
 
 #include "vhost.h"
 
@@ -33,6 +34,26 @@
 static int devices_per_worker = 7;
 module_param(devices_per_worker, int, S_IRUGO);
 MODULE_PARM_DESC(devices_per_worker, "Setup the number of devices used by a single vhost worker thread");
+
+
+static int poll_coalescing = 0; 
+module_param(poll_coalescing, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(poll_coalescing, "Batch notifications made in less than this many jiffiess. Must be higher than poll_stop_idle.");
+
+static int poll_start_rate = 1;
+module_param(poll_start_rate, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(poll_start_rate, "Start continuous polling of virtqueue when rate of events is at least this number per jiffy. If 0, never start polling.");
+
+static int poll_stop_idle = 3*HZ; /* 3 seconds */
+module_param(poll_stop_idle, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(poll_stop_idle, "Stop continuous polling of virtqueue after this many jiffies of no work.");
+
+/* not yet supported */
+static int poll_stop_rate = 0;
+module_param(poll_stop_rate, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(poll_stop_rate, "Stop continuous polling of virtqueue if rate of events drops below this number per seconds (at least for a jiffie).");
+
+/* not yet supported */
 enum {
 	VHOST_MEMORY_MAX_NREGIONS = 64,
 	VHOST_MEMORY_F_LOG = 0x1,
@@ -169,6 +190,91 @@ void vhost_poll_queue(struct vhost_poll *poll)
 	vhost_work_queue(poll->dev, &poll->work);
 }
 
+/* Enable or disable virtqueue polling (vqpoll.enabled) for a virtqueue.
+ *
+ * Enabling this mode it tells the guest not to notify ("kick") us when its
+ * has made more work available on this virtqueue; Rather, we will hontinuously
+ * poll this virtqueue in the worker thread. If multiple virtqueues are polled,
+ * the worker thread polls them all, e.g., in a round-robin fashion.
+ * Note that vqpoll.enabled doesn't always mean that this virtqueue is
+ * actually being polled: The backend (e.g., net.c) may temporarily disable it
+ * using vhost_disable/enable_notify(), while vqpoll.enabled is unchanged.
+ *
+ * It is assumed that these functions are called relatively rarely, when vhost
+ * notices that this virtqueue's usage pattern significantly changed in a way
+ * that makes polling more efficient than notification, or vice versa.
+ * Also, we assume that vhost_vq_disable_vqpoll() is always called on vq
+ * cleanup, so any allocations done by vhost_vq_enable_vqpoll() can be
+ * reclaimed.
+ */
+static void vhost_vq_enable_vqpoll(struct vhost_virtqueue *vq)
+{
+	if (vq->vqpoll.enabled)
+		return; /* already enabled, nothing to do */
+	if (!vq->handle_kick)
+		return; /* polling will be a waste of time if no callback! */
+	if (!(vq->used_flags & VRING_USED_F_NO_NOTIFY)) {
+		/* vq has guest notifications enabled. Disable them,
+		   and instead add vq to the polling list */
+		vhost_disable_notify(vq->dev, vq);
+		list_add_tail(&vq->vqpoll.link, &vq->dev->worker->vqpoll_list);
+	}
+	vq->vqpoll.jiffies_last_kick = jiffies;
+	__get_user(vq->avail_idx, &vq->avail->idx); // TODO: do we need to do this? also,  if we do, why not just use the mapped below?
+
+	vq->vqpoll.enabled = true;
+
+	/* Map userspace's vq->avail to the kernel's memory space, so it
+	 * can be polled without slow switching of page tables. This is
+	 * important so that inactive guests still on the polling list
+	 * do not slow down an active guest.
+	 */
+	if (get_user_pages_fast((unsigned long)vq->avail, 1, 0,
+		&vq->vqpoll.avail_page) != 1) {
+		// TODO: I think this can't happen because we check access
+		// to vq->avail in advance, right??
+		BUG();
+	}
+	vq->vqpoll.avail_mapped = (struct vring_avail *) (
+		(unsigned long)kmap(vq->vqpoll.avail_page) |
+		((unsigned long)vq->avail & ~PAGE_MASK));
+}
+
+/*
+ * This function doesn't always succeed in changing the mode. Sometimes
+ * a temporary race condition prevents turning on guest notifications, so
+ * vq should be polled next time again.
+ */
+static void vhost_vq_disable_vqpoll(struct vhost_virtqueue *vq)
+{
+	if (!vq->vqpoll.enabled) {
+		return; /* already disabled, nothing to do */
+	}
+	vq->vqpoll.enabled = false;
+
+	if (!list_empty(&vq->vqpoll.link)) {
+		/* vq is on the polling list, remove it from this list and
+		 * instead enable guest notifications. */
+		list_del_init(&vq->vqpoll.link);
+		if (unlikely(vhost_enable_notify(vq->dev,vq))
+			&& !vq->vqpoll.shutdown) {
+			/* Race condition: guest wrote before we enabled
+			 * notification, so we'll never get a notification for
+			 * this work - so continue polling mode for a while. */
+			vhost_disable_notify(vq->dev, vq);
+			vq->vqpoll.enabled = true;
+			vhost_enable_notify(vq->dev, vq);
+			return;
+		}
+	}
+
+	if (vq->vqpoll.avail_mapped) {
+		kunmap(vq->vqpoll.avail_page);
+		put_page(vq->vqpoll.avail_page);
+		vq->vqpoll.avail_mapped = 0;
+	}
+}
+
 static void vhost_vq_reset(struct vhost_dev *dev,
 			   struct vhost_virtqueue *vq)
 {
@@ -197,6 +303,10 @@ static void vhost_vq_reset(struct vhost_dev *dev,
 	vq->upend_idx = 0;
 	vq->done_idx = 0;
 	vq->ubufs = NULL;
+	INIT_LIST_HEAD(&vq->vqpoll.link);
+	vq->vqpoll.enabled = false;
+	vq->vqpoll.shutdown = false;
+	vq->vqpoll.avail_mapped = NULL;
 }
 
 /* Switch the current kernel thread's mm context (page tables) to the given
@@ -206,6 +316,48 @@ static inline void set_mm(struct vhost_virtqueue *vq) {
 	struct mm_struct *mm = vq->dev->mm;
 	if (current->mm != mm)
 		use_mm(mm);
+}
+
+/* roundrobin_poll() takes worker->vqpoll_list, and returns one of the
+ * virtqueues which the caller should kick, or NULL in case none should be
+ * kicked. roundrobin_poll() also disables polling on a virtqueue which has
+ * been polled for too long without success.
+ *
+ * This current implementation (the "round-robin" implementation) only
+ * polls the first vq in the list, returning it or NULL as appropriate, and
+ * moves this vq to the end of the list, so next time a different one is
+ * polled.
+ */
+static struct vhost_virtqueue *roundrobin_poll(struct list_head *list) {
+	struct vhost_virtqueue *vq;
+	u16 avail_idx;
+
+	if (list_empty(list))
+		return NULL;
+
+	vq = list_first_entry(list, struct vhost_virtqueue, vqpoll.link);
+	WARN_ON(!vq->vqpoll.enabled);
+	list_move_tail(&vq->vqpoll.link, list);
+
+	/* If poll_coalescing is set, avoid kicking the same vq too often */
+	if (jiffies - vq->vqpoll.jiffies_last_kick < poll_coalescing)
+		return NULL;
+
+	/* See if there is any new work available from the guest. */
+	/* TODO: need to check the optional idx feature, and if we haven't
+	 * reached that idx yet, don't kick... */
+	avail_idx = vq->vqpoll.avail_mapped->idx;
+	if (avail_idx != vq->last_avail_idx) {
+		return vq;
+	}
+	if (jiffies > vq->vqpoll.jiffies_last_kick + poll_stop_idle) {
+		/* We've been polling this virtqueue for a long time with no
+		 * results, so switch back to guest notification
+		 */
+		set_mm(vq);
+		vhost_vq_disable_vqpoll(vq);
+	}
+	return NULL;    
 }
 
 static int vhost_worker_thread(void *data)
@@ -252,11 +404,52 @@ static int vhost_worker_thread(void *data)
 			if (vq)
 				set_mm(vq);
 			work->fn(work);
-			if (need_resched())
-				schedule();
-		} else
-			schedule();
+			/* Keep track of the work rate, for deciding when to
+			 * enable polling */
+			if (vq) {
+				if (vq->vqpoll.jiffies_last_work != jiffies) {
+					vq->vqpoll.jiffies_last_work = jiffies;
+					vq->vqpoll.work_this_jiffy = 0;
+				}
+				vq->vqpoll.work_this_jiffy++;
+			}
+			/* If vq is in the round-robin list of virtqueues being
+			 * constantly checked by this thread, move vq the end
+			 * of the queue, because it had its fair chance now.
+			 */
+			if (vq && !list_empty(&vq->vqpoll.link)) {
+				list_move_tail(&vq->vqpoll.link,
+					&worker->vqpoll_list);
+			}
+			/* Otherwise, if this vq is looking for notifications
+			 * but vq polling is not enabled for it, do it now.
+			 */
+			else if (poll_start_rate && vq && vq->handle_kick &&
+				!vq->vqpoll.enabled &&
+				!vq->vqpoll.shutdown &&
+				!(vq->used_flags & VRING_USED_F_NO_NOTIFY) &&
+				vq->vqpoll.work_this_jiffy >=
+					poll_start_rate) {
+				vhost_vq_enable_vqpoll(vq);
+			}
+		}
 
+		/* Check one virtqueue from the round-robin list */
+		if (!list_empty(&worker->vqpoll_list)) {
+			struct vhost_virtqueue *vq;
+			vq = roundrobin_poll(&worker->vqpoll_list);
+			if (vq) {
+				set_mm(vq);
+				vq->handle_kick(&vq->poll.work);
+				vq->vqpoll.jiffies_last_kick=jiffies;
+			}
+			/* If our polling list isn't empty, ask to continue
+			 * running this thread, don't yield.
+			 */
+			__set_current_state(TASK_RUNNING);
+		}
+		if (need_resched())
+			schedule();
 	}
 	set_fs(oldfs);
 	return 0;
@@ -352,6 +545,14 @@ static void vhost_dev_assign_worker(struct vhost_dev *dev)
 		list_add(&worker->node, &workers_pool.workers_list);
 		worker->worker_thread = kthread_create(vhost_worker_thread,
 						worker, "vhost-%d", worker->id);
+		/*
+		 * vqpoll_list starts out empty, so we don't continuously
+		 * poll on any virtqueue, and rather just wait for guest
+		 * notifications. Later when we notice work on some virtqueue,
+		 * we will switch it to polling mode, i.e., add it to
+		 * vqpoll_list and disable guest notifications.
+		 */
+		INIT_LIST_HEAD(&worker->vqpoll_list);
 
 	}
 	spin_unlock_irq(&workers_pool.workers_lock);
@@ -483,6 +684,26 @@ void vhost_dev_stop(struct vhost_dev *dev)
 	}
 }
 
+/* shutdown_vqpoll() asks the worker thread to shut down virtqueue polling
+ * mode for a given virtqueue which is itself being shut down. We ask the
+ * worker thread to do this rather than doing it directly, so that we don't
+ * race with the worker thread's use of the queue.
+ */
+static void shutdown_vqpoll_work(struct vhost_work *work)
+{
+	work->vq->vqpoll.shutdown = true;
+	vhost_vq_disable_vqpoll(work->vq);
+	WARN_ON(work->vq->vqpoll.avail_mapped);
+}
+
+static void shutdown_vqpoll(struct vhost_virtqueue *vq)
+{
+	struct vhost_work work;
+	vhost_work_init(&work, vq, shutdown_vqpoll_work);
+	vhost_work_queue(vq->dev, &work);
+	vhost_work_flush(vq->dev, &work);
+}
+
 /* Caller should have device mutex if and only if locked is set */
 void vhost_dev_cleanup(struct vhost_dev *dev, bool locked)
 {
@@ -499,6 +720,12 @@ void vhost_dev_cleanup(struct vhost_dev *dev, bool locked)
 			eventfd_ctx_put(dev->vqs[i].call_ctx);
 		if (dev->vqs[i].call)
 			fput(dev->vqs[i].call);
+
+		shutdown_vqpoll(&dev->vqs[i]);
+		// TODO: Think: When a device goes down, the worker might
+		// still have its mm as its current mm. We will never use it
+		// again (before the next work, we switch mm again) but maybe
+		// holding it wastes memory?
 		vhost_vq_reset(dev, dev->vqs + i);
 	}
 	vhost_dev_free_iovecs(dev);
@@ -530,6 +757,8 @@ void vhost_dev_cleanup(struct vhost_dev *dev, bool locked)
 		// avoid the following, the device might still use worker lock
 		// dev->worker = NULL;
 	}
+	// TODO: maybe we need to copy dev->mm, zero it, and only then mmput,
+	// to ensure we don't mm_use it again?
 	if (dev->mm)
 		mmput(dev->mm);
 	dev->mm = NULL;
@@ -1563,6 +1792,19 @@ bool vhost_enable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
 	u16 avail_idx;
 	int r;
 
+	/* In polling mode, when the backend (e.g., net.c) asks to enable
+	 * notifications, we don't enable guest notifications. Instead, start
+	 * polling on this vq by adding it to the round-robin list.
+	 */
+	if (vq->vqpoll.enabled) {
+		if (list_empty(&vq->vqpoll.link)) {
+			list_add_tail(&vq->vqpoll.link,
+				&vq->dev->worker->vqpoll_list);
+			vq->vqpoll.jiffies_last_kick = jiffies;
+		}
+		return false;
+	}
+
 	if (!(vq->used_flags & VRING_USED_F_NO_NOTIFY))
 		return false;
 	vq->used_flags &= ~VRING_USED_F_NO_NOTIFY;
@@ -1598,6 +1840,17 @@ bool vhost_enable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
 void vhost_disable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
 {
 	int r;
+
+	/* If this virtqueue is vqpoll.enabled, and on the polling list, it
+	 * will generate notifications even if the guest is asked not to send
+	 * them. So we must remove it from the round-robin polling list.
+	 * Note that vqpoll.enabled remains set.
+	 */
+	if (vq->vqpoll.enabled) {
+		if(!list_empty(&vq->vqpoll.link))
+			list_del_init(&vq->vqpoll.link);
+		return;
+	}
 
 	if (vq->used_flags & VRING_USED_F_NO_NOTIFY)
 		return;
