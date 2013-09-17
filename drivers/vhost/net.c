@@ -39,7 +39,14 @@ MODULE_PARM_DESC(experimental_zcopytx, "Enable Zero Copy TX;"
 
 /* Max number of bytes transferred before requeueing the job.
  * Using this limit prevents one virtqueue from starving others. */
-#define VHOST_NET_WEIGHT 0x80000
+static int VHOST_MAX_NET_WEIGHT = 0x80000;
+module_param(VHOST_MAX_NET_WEIGHT, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(VHOST_MAX_NET_WEIGHT, "Max number of bytes transferred before requeueing the job. Using this limit prevents one virtqueue from starving others");
+
+static int VHOST_MIN_NET_WEIGHT = 0x1000;
+module_param(VHOST_MIN_NET_WEIGHT, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(VHOST_MIN_NET_WEIGHT, "Min number of bytes transferred before requeueing the job. Using this limit prevents switching queues too often");
+#include <linux/ratelimit.h>
 
 /* MAX number of TX used buffers for outstanding zerocopy */
 #define VHOST_MAX_PEND 128
@@ -379,7 +386,7 @@ static void handle_tx(struct vhost_net *net)
 			vhost_zerocopy_signal_used(net, vq);
 		total_len += len;
 		vhost_net_tx_packet(net);
-		if (unlikely(total_len >= VHOST_NET_WEIGHT)) {
+		if (!vhost_can_continue(vq, total_len, VHOST_MIN_NET_WEIGHT, VHOST_MAX_NET_WEIGHT)) {
 			vhost_poll_queue(&vq->poll);
 			break;
 		}
@@ -569,7 +576,7 @@ static void handle_rx(struct vhost_net *net)
 		if (unlikely(vq_log))
 			vhost_log_write(vq, vq_log, log, vhost_len);
 		total_len += vhost_len;
-		if (unlikely(total_len >= VHOST_NET_WEIGHT)) {
+		if (!vhost_can_continue(vq, total_len, VHOST_MIN_NET_WEIGHT, VHOST_MAX_NET_WEIGHT)) {
 			vhost_poll_queue(&vq->poll);
 			break;
 		}

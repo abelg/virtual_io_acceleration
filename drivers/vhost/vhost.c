@@ -54,6 +54,17 @@ module_param(poll_stop_rate, int, S_IRUGO|S_IWUSR);
 MODULE_PARM_DESC(poll_stop_rate, "Stop continuous polling of virtqueue if rate of events drops below this number per seconds (at least for a jiffie).");
 
 /* not yet supported */
+static int max_work_stuck_cycles = -1;
+module_param(max_work_stuck_cycles, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(max_work_stuck_cycles, "How many cycles need to elapse to consider the worker list stuck (-1 = disabled)");
+
+static int max_queue_stuck_cycles = -1;
+module_param(max_queue_stuck_cycles, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(max_queue_stuck_cycles, "How many cycles need to elapse to consider a queue as a stuck queue (-1 = disabled)");
+
+static int max_queue_stuck_size = 0;
+module_param(max_queue_stuck_size, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(max_queue_stuck_size, "The queue will be considered stuck as long as there are no more than this number of items (0=disabled)");
 enum {
 	VHOST_MEMORY_MAX_NREGIONS = 64,
 	VHOST_MEMORY_F_LOG = 0x1,
@@ -360,6 +371,86 @@ static struct vhost_virtqueue *roundrobin_poll(struct list_head *list) {
 	return NULL;    
 }
 
+
+/*
+ * Check if any of the queues has pending works and no new items has been
+ * added for specific amount of time. This probably means that the queue is stuck
+ * and the pending items need to be processed ASAP to release it so the VM can continue
+ * processing data. If no stuck queues were found, continue as far as the amount of data
+ * processed is less than the specified limit.
+ */
+bool vhost_can_continue(struct vhost_virtqueue  *vq, size_t processed_data, size_t data_min_limit, size_t data_max_limit) {
+	struct vhost_virtqueue *vq_iterator, *next = NULL;
+	struct list_head *list = &vq->dev->worker->vqpoll_list;
+	u64 elapsed_cycles;
+	u64 cycles;
+
+
+	// if we didn't process the minimum amount of data we can always continue
+	if (processed_data < data_min_limit)
+		return true;
+
+	// If we processed moren than the maximum we can not continue
+	if (processed_data > data_max_limit)
+		return false;
+
+	rdtscll(cycles);
+	elapsed_cycles = cycles - vq->dev->worker->last_work_tsc;
+	// if there are work items pending for too long we can not continue
+	if (max_work_stuck_cycles>=0 && elapsed_cycles>max_work_stuck_cycles && !list_empty(&vq->dev->worker->work_list)) {
+		return false;
+	}
+
+	// check if there are stuck queues 
+	if (max_queue_stuck_cycles >=0) {
+		list_for_each_entry_safe(vq_iterator, next, list, vqpoll.link) {                        
+			u16 pending_items;                      
+
+			// ignore the queue that is currently being processed
+			if (vq_iterator == vq) {
+				vq_iterator->vqpoll.last_pending_items = 0;
+				continue;
+			}
+
+			// ignore queues that has no pending data
+			pending_items = vq_iterator->vqpoll.avail_mapped->idx - vq_iterator->last_avail_idx;
+			if (pending_items == 0) {
+				vq_iterator->vqpoll.last_pending_items = 0;
+				continue;
+			}
+
+			rdtscll(cycles);
+			// check if the queue stuck with pending data since the last check (?)
+			if (pending_items == vq_iterator->vqpoll.last_pending_items) {
+				// stuck sizes is used to avoid detecting a bursty queue as a stuck queue
+				// (don't consider a queue stuck if it holds too many items = max_queue_stuck_size)
+				if (max_queue_stuck_size >  0 &&  pending_items > max_queue_stuck_size)
+					continue;
+
+				elapsed_cycles = cycles - vq_iterator->vqpoll.stuck_cycles;                           
+				// is the queue stuck for too long ?
+				if (elapsed_cycles >= max_queue_stuck_cycles) {
+
+					// put current queue in the 2nd place if it didn't send more than half of the max
+					// and it's being polled
+					if (vq->vqpoll.enabled && processed_data < data_max_limit / 2)
+						list_move(&vq->vqpoll.link, list);
+
+					// put stuck queue in the 1st place if it's being polled
+					list_move(&vq_iterator->vqpoll.link, list);
+					return false;
+				}
+			} else {
+				// the queue is not stuck, reset stuck 
+				vq_iterator->vqpoll.last_pending_items = pending_items;
+				vq_iterator->vqpoll.stuck_cycles = cycles;
+			}
+		}
+	}
+
+	// no stuck queues, no works, no maximum  => we can continue
+	return true;
+}
 static int vhost_worker_thread(void *data)
 {
 	struct vhost_worker *worker = data;
@@ -404,6 +495,7 @@ static int vhost_worker_thread(void *data)
 			if (vq)
 				set_mm(vq);
 			work->fn(work);
+			rdtscll(worker->last_work_tsc);
 			/* Keep track of the work rate, for deciding when to
 			 * enable polling */
 			if (vq) {
