@@ -628,8 +628,10 @@ static int vhost_net_open(struct inode *inode, struct file *f)
 		return r;
 	}
 
-	vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, POLLOUT, dev);
-	vhost_poll_init(n->poll + VHOST_NET_VQ_RX, handle_rx_net, POLLIN, dev);
+	vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, POLLOUT,
+			&n->vqs[VHOST_NET_VQ_TX]);
+	vhost_poll_init(n->poll + VHOST_NET_VQ_RX, handle_rx_net, POLLIN,
+			&n->vqs[VHOST_NET_VQ_RX]);
 	n->tx_poll_state = VHOST_NET_POLL_DISABLED;
 
 	f->private_data = n;
@@ -1013,6 +1015,7 @@ static int vhost_net_init(void)
 {
 	if (experimental_zcopytx)
 		vhost_enable_zcopy(VHOST_NET_VQ_TX);
+	vhost_init();
 	return misc_register(&vhost_net_misc);
 }
 module_init(vhost_net_init);
@@ -1020,6 +1023,7 @@ module_init(vhost_net_init);
 static void vhost_net_exit(void)
 {
 	misc_deregister(&vhost_net_misc);
+	vhost_exit();
 }
 module_exit(vhost_net_exit);
 

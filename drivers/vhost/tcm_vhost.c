@@ -1002,7 +1002,7 @@ static int vhost_scsi_open(struct inode *inode, struct file *f)
 	if (!s)
 		return -ENOMEM;
 
-	vhost_work_init(&s->vs_completion_work, vhost_scsi_complete_cmd_work);
+	vhost_work_init(&s->vs_completion_work, NULL, vhost_scsi_complete_cmd_work);
 
 	s->vqs[VHOST_SCSI_VQ_CTL].handle_kick = vhost_scsi_ctl_handle_kick;
 	s->vqs[VHOST_SCSI_VQ_EVT].handle_kick = vhost_scsi_evt_handle_kick;
