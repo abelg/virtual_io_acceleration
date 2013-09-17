@@ -5372,6 +5372,60 @@ static void eli_copy_idt_entry(struct vcpu_vmx *vmx,
 	}
 }
 
+static int pvpi_init(struct vcpu_vmx *vmx,
+			gva_t notif_vector, gva_t injected_vector) {
+	struct x86_exception err;
+	u32 vector;
+	struct kvm_vcpu *vcpu;
+	gpa_t notif_vector_gpa;
+	gpa_t injected_vector_gpa;
+	int i;
+	struct page *shared_page;
+	int *shared_descriptor;	
+		
+	notif_vector_gpa = vmx->vcpu.arch.mmu.gva_to_gpa(
+				&vmx->vcpu, notif_vector, 0, &err);
+	injected_vector_gpa = vmx->vcpu.arch.mmu.gva_to_gpa(
+				&vmx->vcpu, injected_vector, 0, &err);
+
+	shared_page = gfn_to_page(vmx->vcpu.kvm,
+				  injected_vector_gpa >> PAGE_SHIFT);
+
+	if (is_error_page(shared_page)) {
+			kvm_release_page_clean(shared_page);
+			printk(KERN_ERR "kvm-eli: error getting shared page!\n");
+			return 0;
+	}
+
+	shared_descriptor = kmap(shared_page);
+
+	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
+		struct vcpu_vmx *v = to_vmx(vcpu);
+		v->posted_interrupts.notif_vector_gpa = notif_vector_gpa;
+		v->posted_interrupts.injected_vector_gpa = injected_vector_gpa;
+		v->posted_interrupts.shared_descriptor_page = shared_page;
+		v->posted_interrupts.shared_descriptor =
+			shared_descriptor+vcpu->vcpu_id;
+		*(v->posted_interrupts.shared_descriptor) = -1;
+	}
+
+	vector = POSTED_INTERRUPT_VECTOR;
+	kvm_write_guest(vmx->vcpu.kvm,
+			vmx->posted_interrupts.notif_vector_gpa, &vector, 4);
+	return 1;
+}
+static void pvpi_release_descriptor(struct vcpu_vmx *vmx) {
+	struct page *shared_page;
+	
+	if (!vmx->posted_interrupts.notif_vector_gpa) {
+		return;
+	}
+	
+	shared_page = vmx->posted_interrupts.shared_descriptor_page;
+	kunmap(shared_page);
+	kvm_release_page_dirty(shared_page);
+	return;
+}
 /* Paravirtual posted interrupts send an IPI to the core running a certain
  * guest, intending that it will be handled in this guest (without exit).
  * However, in some rare cases an unrelated exit occurs, and the IPI arrives
@@ -5625,6 +5679,7 @@ static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 /* hypercalls used to start/stop ExitLess interrupt completion (EOI) */
 #define DI_START_EOI             1101
 #define DI_STOP_EOI              1201
+#define PI_INITIALIZE            2000
 
 static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 {
@@ -5660,6 +5715,11 @@ static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 			eli_eoi_exiting(vmx, true);
 			vmx->eli.exitless_eoi = false;
 		}
+		break;
+	case PI_INITIALIZE:
+		pvpi_init(vmx,
+			(gva_t)kvm_register_read(vcpu, VCPU_REGS_RBX),
+			(gva_t)kvm_register_read(vcpu, VCPU_REGS_RCX));
 		break;
 	default:
 		return 0; /* hypercall was not handled here */
@@ -7510,6 +7570,8 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	if (vcpu->vcpu_id == 0)
+		pvpi_release_descriptor(vmx);
 	free_page((unsigned long)vmx->vmx_msr_bitmap_legacy_x2apic);
 	free_page((unsigned long)vmx->vmx_msr_bitmap_longmode_x2apic);
 
@@ -7612,6 +7674,8 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
 
 	vmx->eli.host_idt.address = 0;
 	vmx->eli.enabled = false;
+	vmx->posted_interrupts.enabled = false;
+	vmx->posted_interrupts.notif_vector_gpa = 0;
 
 	return &vmx->vcpu;
 
