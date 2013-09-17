@@ -5473,6 +5473,23 @@ static int eli_disable(struct vcpu_vmx *vmx) {
 
 	return 1;
 }
+/* Handle accesses to the GDTR register. Used only when ELI is enabled */
+static int handle_gdtr_idtr(struct kvm_vcpu *vcpu) {
+	printk(KERN_WARNING "kvm-eli: unexpected GDTR/IDTR exit, disabling ELI\n");
+	eli_disable(to_vmx(vcpu));
+
+	return 1;
+}
+
+/* Handle accesses to the LDTR register. Used only when ELI is enabled */
+static int handle_ldtr_tr(struct kvm_vcpu *vcpu) {
+	printk(KERN_WARNING "kvm-eli: unexpected LDTR exit, temporary rollback to inject mode (vcpu=%d)\n",
+	       vcpu->vcpu_id);
+	eli_set_inject_mode(to_vmx(vcpu), true);
+	
+	return 1;
+}
+
 int is_eoi(struct vcpu_vmx *vmx) {
 	/* check for x2APIC */
 	if (apic_x2apic_mode(vmx->vcpu.arch.apic))
@@ -6630,6 +6647,8 @@ static int (*const kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_PAUSE_INSTRUCTION]       = handle_pause,
 	[EXIT_REASON_MWAIT_INSTRUCTION]	      = handle_invalid_op,
 	[EXIT_REASON_MONITOR_INSTRUCTION]     = handle_invalid_op,
+	[EXIT_REASON_GDTR_IDTR]		      = handle_gdtr_idtr,
+	[EXIT_REASON_LDTR_TR]		      = handle_ldtr_tr,
 };
 
 static const int kvm_vmx_max_exit_handlers =
