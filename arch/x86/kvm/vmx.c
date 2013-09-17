@@ -6,6 +6,7 @@
  *
  * Copyright (C) 2006 Qumranet, Inc.
  * Copyright 2010 Red Hat, Inc. and/or its affiliates.
+ * Copyright (C) IBM Corporation, 2013
  *
  * Authors:
  *   Avi Kivity   <avi@qumranet.com>

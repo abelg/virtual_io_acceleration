@@ -1,5 +1,6 @@
 /*
  * Common interrupt code for 32 and 64 bit
+ * Copyright (C) IBM Corporation, 2013
  */
 #include <linux/cpu.h>
 #include <linux/interrupt.h>

@@ -1,6 +1,7 @@
 /*
  *	Local APIC handling, local APIC timers
  *
+ *      Copyright (C) IBM Corporation, 2013
  *	(c) 1999, 2000, 2009 Ingo Molnar <mingo@redhat.com>
  *
  *	Fixes

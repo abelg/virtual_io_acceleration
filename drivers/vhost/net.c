@@ -1,6 +1,8 @@
 /* Copyright (C) 2009 Red Hat, Inc.
  * Author: Michael S. Tsirkin <mst@redhat.com>
  *
+ * Copyright (C) IBM Corporation, 2013
+ *
  * This work is licensed under the terms of the GNU GPL, version 2.
  *
  * virtio-net server in host kernel.

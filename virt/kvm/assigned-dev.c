@@ -2,6 +2,7 @@
  * Kernel-based Virtual Machine - device assignment support
  *
  * Copyright (C) 2010 Red Hat, Inc. and/or its affiliates.
+ * Copyright (C) IBM Corporation, 2013
  *
  * This work is licensed under the terms of the GNU GPL, version 2.  See
  * the COPYING file in the top-level directory.
