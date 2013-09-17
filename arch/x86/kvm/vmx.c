@@ -5435,6 +5435,88 @@ static void pvpi_release_descriptor(struct vcpu_vmx *vmx) {
 #define MAX_CPUS 128
 static struct vcpu_vmx *pvpi_vmxs[MAX_CPUS];
 
+/* vmx_send_posted_interrupt injects an interrupt into a running guest by
+ * emulating the posted-interrupt feature of future processors on current
+ * processors, using ELI to send a POSTED_INTERRUPT_VECTOR to the guest
+ * without causing an exit, and a modified guest which runs the intended
+ * vector's handler when receiving the fixed POSTED_INTERRUPT.
+ *
+ * Our modified Linux guest runs the appropriate handler using on a modified
+ * do_irq, and since that code only contains handlers for vectors lower than
+ * PVPI_FILTER_VECTOR (defined below), vmx_send_posted_interrupt will refuse
+ * to send vectors higher or equal to that filter.
+ */
+#define PVPI_FILTER_VECTOR 0xf0
+static int vmx_send_posted_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+ 				     int vector, int level, int trig_mode)
+{	
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int me;
+	int cpu;
+
+	if (!vmx->posted_interrupts.enabled) {
+		return 0;
+	}
+
+	/* Send paravirtual posted interrupt only if the guest is running, and,
+	 * for reasons explained above, vector is below PVPI_FILTER_VECTOR.
+	 * We don't mind if right after we check, the guest exits - at worst
+	 * the IPI will arrive at the host and we have a handler to.
+	 * TODO: consider also the very unlikely case that the guest has time
+	 * to exit, and reenter a different guest, before we send the IPI.
+	 */
+	if (vmx->vcpu.mode != IN_GUEST_MODE || vector >= PVPI_FILTER_VECTOR)
+		return 0;
+
+	me = get_cpu();
+	cpu = vmx->vcpu.cpu;
+
+	/* send notification vector if different cpu and not pending vector */
+	if (cpu != me) {
+		int pending_vector;
+		/*
+		 * if *shared_descriptor == -1 then
+		 *      *shared_descriptor = vector
+		 *      pending_vector = -1
+		 * else
+		 *      *shared_descriptor is unchanged
+		 *      pending_vector = *shared_descriptor
+		 */		
+		pending_vector = cmpxchg(
+			vmx->posted_interrupts.shared_descriptor, -1, vector);
+
+		if (pending_vector == vector) {
+			put_cpu();
+			return 1;
+		}
+		
+		if (pending_vector != -1) {
+			put_cpu();
+			return 0;
+		}
+
+		pvpi_vmxs[cpu] = vmx;
+		
+		apic->send_IPI_mask(cpumask_of(cpu), POSTED_INTERRUPT_VECTOR);
+		++(vmx->vcpu.stat.elvis_injections);
+		vmx->posted_interrupts.injected_vector = vector;
+		vmx->posted_interrupts.injected_delivery_mode = delivery_mode;
+		vmx->posted_interrupts.injected_level = level;
+		vmx->posted_interrupts.injected_trig_mode = trig_mode;
+
+		put_cpu();
+		return 1;
+	} else {
+		vmx->posted_interrupts.injected_vector = -1;
+	}
+	
+	put_cpu();
+	return 0;
+}
+
+static int vmx_has_posted_interrupts(struct kvm_vcpu *vcpu) {
+	return to_vmx(vcpu)->posted_interrupts.enabled;
+}
 /* eli_init initializes ELI (Exit-Less Interrupts) for this vcpu, by
  * remembering the given location (GVA) for the shadow IDT.
  * The contents (and size) of the shadow IDT will only be filled later,
@@ -8535,6 +8617,8 @@ static struct kvm_x86_ops vmx_x86_ops = {
 	.set_supported_cpuid = vmx_set_supported_cpuid,
 
 	.eli_remap_vector = vmx_eli_remap_vector,
+	.send_posted_interrupt =  vmx_send_posted_interrupt,
+	.has_posted_interrupts = vmx_has_posted_interrupts,
 
 	.has_wbinvd_exit = cpu_has_vmx_wbinvd_exit,
 
