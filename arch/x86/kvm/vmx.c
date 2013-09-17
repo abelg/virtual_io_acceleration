@@ -447,6 +447,10 @@ struct vcpu_vmx {
 		gpa_t host_idt_gpa;
 		/* Indicates if ELI is enabled or not */
 		bool enabled;
+		/* Enabled when we need to temporarily run the guest with its
+		 * original IDT, so we can inject a virtual interrupt.
+		 */
+		bool inject_mode;
 		/*
 		 * The guest and host use different vectors for the assigned
 		 * device interrupts. This field is used to remap the vectors
@@ -4262,6 +4266,47 @@ static void enable_nmi_window(struct kvm_vcpu *vcpu)
 	vmcs_write32(CPU_BASED_VM_EXEC_CONTROL, cpu_based_vm_exec_control);
 }
 
+/* Enables or disables ELI's injection mode. When injection mode is disabled
+ * the guest runs with normal ELI: the shadow IDT is used, and the CPU is
+ * configured to deliver interrupts directly into the guest without exit.
+ * When injection mode is enabled, the guest runs with the original guest IDT
+ * and the CPU is configured to exit on external interrupts. This mode is
+ * necessary for injecting virtual interrupts into the guest.
+ */
+static void eli_set_inject_mode(struct vcpu_vmx *vmx, bool inject_mode) {
+	struct desc_ptr *idt;
+	u32 pin_based_exec_ctrl, cpu_based_2nd_exec_ctrl;
+	if (inject_mode == vmx->eli.inject_mode) {
+		return;
+	}
+	vmx->eli.inject_mode = inject_mode;
+
+	pin_based_exec_ctrl = vmcs_read32(PIN_BASED_VM_EXEC_CONTROL);
+	cpu_based_2nd_exec_ctrl = vmcs_read32(SECONDARY_VM_EXEC_CONTROL);
+	
+	if (inject_mode) {
+		/* Use the guest idt for guest mode execution */
+		idt = &vmx->eli.guest_idt;
+		/* Enable exit on external interrupts */
+		pin_based_exec_ctrl |= PIN_BASED_EXT_INTR_MASK;
+		/* No need to trap changes in the IDTR register */
+		cpu_based_2nd_exec_ctrl &= ~SECONDARY_EXEC_DESC_TABLE_EXITING;
+	} else {
+		/* use the shadow IDT for guest mode execution */
+		idt = &vmx->eli.host_idt;
+		/* Disable exit on external interrupts,
+		   (interrupts are delivered through the shadow idt) */
+		pin_based_exec_ctrl &= ~PIN_BASED_EXT_INTR_MASK;
+		/* Trap any attempt of the guest to change the IDTR register */
+		cpu_based_2nd_exec_ctrl |= SECONDARY_EXEC_DESC_TABLE_EXITING;
+	}
+	
+	vmcs_write32(GUEST_IDTR_LIMIT, idt->size);
+	vmcs_writel(GUEST_IDTR_BASE, idt->address);
+	vmcs_write32(PIN_BASED_VM_EXEC_CONTROL,	pin_based_exec_ctrl);
+	vmcs_write32(SECONDARY_VM_EXEC_CONTROL, cpu_based_2nd_exec_ctrl);
+}
+
 static void vmx_inject_irq(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -4287,6 +4332,13 @@ static void vmx_inject_irq(struct kvm_vcpu *vcpu)
 	} else
 		intr |= INTR_TYPE_EXT_INTR;
 	vmcs_write32(VM_ENTRY_INTR_INFO_FIELD, intr);
+
+	/* In ELI, we must enter injection mode before we can inject a
+	 * virtual interrupt.
+	 */
+	if (vmx->eli.enabled)
+		eli_set_inject_mode(vmx, true);
+
 }
 
 static void vmx_inject_nmi(struct kvm_vcpu *vcpu)
