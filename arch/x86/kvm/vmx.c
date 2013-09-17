@@ -5763,6 +5763,7 @@ static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 			if (vmx->eli.inject_mode)
 				eli_set_inject_mode(vmx, false);
 			else {
+				if (!vmx->posted_interrupts.enabled)
 				vmx->eli.exit_handled = true;
 			}
 		} else if (!vmx->eli.inject_mode && valid  && type == INTR_TYPE_EXT_INTR) {
