@@ -431,6 +431,23 @@ struct vcpu_vmx {
 
 	/* Support for a guest hypervisor (nested VMX) */
 	struct nested_vmx nested;
+
+	/* Support for Exit-Less Interrupts (ELI) */
+	struct {
+		/* IDTR used to run the guest when ELI is enabled.
+		 * This descriptor points to the shadow IDT (GVA).
+		 */
+		struct desc_ptr host_idt;
+		/* IDTR the guest believes it is using (GVA).
+		 */
+		struct desc_ptr guest_idt;
+		/* Guest physical address of the shadow IDT (note that
+		 * host_idt.address is the guest virtual address).
+		 */
+		gpa_t host_idt_gpa;
+		/* Indicates if ELI is enabled or not */
+		bool enabled;
+	} eli;
 };
 
 enum segment_cache_field {
@@ -4868,9 +4885,61 @@ static int handle_halt(struct kvm_vcpu *vcpu)
 	return kvm_emulate_halt(vcpu);
 }
 
+/* eli_init initializes ELI (Exit-Less Interrupts) for this vcpu, by
+ * remembering the given location (GVA) for the shadow IDT.
+ * The contents (and size) of the shadow IDT will only be filled later,
+ * when ELI is enabled (see eli_enable()), based the guest's IDT and the
+ * interrupts we'll want to assign to the guest.
+ */
+static int eli_init(struct vcpu_vmx *vmx, gva_t host_idt_gva)
+{
+	struct x86_exception err;
+	gpa_t gpa;
+
+	if (host_idt_gva == 0) {
+		printk(KERN_ERR "kvm-eli: missing shadow IDT address\n");
+		return 0;
+	}
+	gpa = vmx->vcpu.arch.mmu.gva_to_gpa(&vmx->vcpu, host_idt_gva, 0, &err);
+	vmx->eli.host_idt_gpa = gpa;
+	vmx->eli.host_idt.address = host_idt_gva;
+	return 1;
+}
+
+/* eli_init for all the vcpus, assuming one shadow IDT for all */
+static void eli_init_all(struct vcpu_vmx *vmx, gva_t gva)
+{
+	struct kvm_vcpu *vcpu;
+	int i;
+	
+	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
+		eli_init(to_vmx(vcpu), gva);
+	}
+}
+
+#define DI_INITIALIZE             300
+
+static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	unsigned long vmcall_id = kvm_register_read(vcpu, VCPU_REGS_RAX);
+	switch (vmcall_id) {
+	case DI_INITIALIZE:
+		eli_init_all(vmx,
+			(gva_t) kvm_register_read(&vmx->vcpu, VCPU_REGS_RBX));
+		break;
+	default:
+		return 0; /* hypercall was not handled here */
+		break;
+	}
+	return 1;
+}
+
 static int handle_vmcall(struct kvm_vcpu *vcpu)
 {
 	skip_emulated_instruction(vcpu);
+	if (eli_handle_vmcall(vcpu))
+		return 1;
 	kvm_emulate_hypercall(vcpu);
 	return 1;
 }
@@ -6753,6 +6822,9 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
 
 	vmx->nested.current_vmptr = -1ull;
 	vmx->nested.current_vmcs12 = NULL;
+
+	vmx->eli.host_idt.address = 0;
+	vmx->eli.enabled = false;
 
 	return &vmx->vcpu;
 
