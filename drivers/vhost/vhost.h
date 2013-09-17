@@ -10,6 +10,7 @@
 #include <linux/uio.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_ring.h>
+#include <linux/virtio_blk.h>
 #include <linux/atomic.h>
 
 struct vhost_device;
@@ -332,6 +333,16 @@ enum {
 	VHOST_NET_FEATURES = VHOST_FEATURES |
 			 (1ULL << VHOST_NET_F_VIRTIO_NET_HDR) |
 			 (1ULL << VIRTIO_NET_F_MRG_RXBUF),
+	/* already declare in drivers/vhost/blk.h
+	 
+	VHOST_BLK_FEATURES =    (1ULL << VIRTIO_F_NOTIFY_ON_EMPTY) |
+			(1ULL << VIRTIO_RING_F_INDIRECT_DESC) |
+			(1ULL << VIRTIO_BLK_F_SEG_MAX) |
+			(1ULL << VIRTIO_BLK_F_GEOMETRY) |
+			(1ULL << VIRTIO_BLK_F_TOPOLOGY) |
+			(1ULL << VIRTIO_BLK_F_SCSI) |
+			(1ULL << VIRTIO_BLK_F_BLK_SIZE),
+	*/
 };
 
 static inline int vhost_has_feature(struct vhost_dev *dev, int bit)
