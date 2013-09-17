@@ -4930,6 +4930,10 @@ static int handle_wrmsr(struct kvm_vcpu *vcpu)
 	u64 data = (vcpu->arch.regs[VCPU_REGS_RAX] & -1u)
 		| ((u64)(vcpu->arch.regs[VCPU_REGS_RDX] & -1u) << 32);
 
+	if (to_vmx(vcpu)->eli.exit_handled) {
+		skip_emulated_instruction(vcpu);
+		return 1;
+	}
 	msr.data = data;
 	msr.index = ecx;
 	msr.host_initiated = false;
@@ -5380,6 +5384,19 @@ static void eli_remap(struct vcpu_vmx *vmx) {
 					vmx->eli.remap_gv_to_hirq[i]);
 	}
 }
+int is_eoi(struct vcpu_vmx *vmx) {
+	/* check for x2APIC */
+	if (apic_x2apic_mode(vmx->vcpu.arch.apic))
+			/* check for x2APIC */
+		return vmx->exit_reason == EXIT_REASON_MSR_WRITE &&
+			vmx->vcpu.arch.regs[VCPU_REGS_RCX] == EOI_MSR;
+			
+	else
+	/* check for xAPIC */
+		return vmx->exit_reason == EXIT_REASON_APIC_ACCESS &&
+			((vmcs_readl(EXIT_QUALIFICATION) & APIC_ACCESS_OFFSET)
+			 == APIC_EOI);
+}
 static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 	vmx->eli.exit_handled = false;
 
@@ -5397,7 +5414,15 @@ static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 		u32 type = vmx->idt_vectoring_info & VECTORING_INFO_TYPE_MASK;
 		u32 vector = vmx->idt_vectoring_info & VECTORING_INFO_VECTOR_MASK;
 		bool valid = vmx->idt_vectoring_info & VECTORING_INFO_VALID_MASK;
-	        if (!vmx->eli.inject_mode && valid  && type == INTR_TYPE_EXT_INTR) {
+		if (is_eoi(vmx)) {
+			/* disable injection mode after EOI to a previously
+			 * injected virtual interrupt */
+			if (vmx->eli.inject_mode)
+				eli_set_inject_mode(vmx, false);
+			else {
+				vmx->eli.exit_handled = true;
+			}
+		} else if (!vmx->eli.inject_mode && valid  && type == INTR_TYPE_EXT_INTR) {
 			recreate_intr(vector);
 			vmx->eli.exit_handled = true;
 			/* Note we do NOT acknowledge (ack_APIC_irq()) the
@@ -5490,6 +5515,14 @@ static int handle_xsetbv(struct kvm_vcpu *vcpu)
 
 static int handle_apic_access(struct kvm_vcpu *vcpu)
 {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	/* check if ELI already handled the EOI */
+	if (vmx->eli.enabled && vmx->eli.exit_handled) {
+		skip_emulated_instruction(vcpu);
+		return 1;
+	}
+ 
 	if (likely(fasteoi)) {
 		unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
 		int access_type, offset;
