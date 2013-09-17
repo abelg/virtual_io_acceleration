@@ -56,6 +56,11 @@
 #include <asm/tsc.h>
 #include <asm/hypervisor.h>
 
+int pi_notif_vector = -1;
+EXPORT_SYMBOL_GPL(pi_notif_vector);
+int* pi_injected_vector;
+EXPORT_SYMBOL_GPL(pi_injected_vector);
+
 unsigned int num_processors;
 
 unsigned disabled_cpus __cpuinitdata;

@@ -100,6 +100,10 @@ int arch_show_interrupts(struct seq_file *p, int prec)
 	for_each_online_cpu(j)
 		seq_printf(p, "%10u ", irq_stats(j)->irq_tlb_count);
 	seq_printf(p, "  TLB shootdowns\n");
+	seq_printf(p, "%*s: ", prec, "PIs");
+	for_each_online_cpu(j)
+		seq_printf(p, "%10u ", irq_stats(j)->irq_eli_pis_count);
+	seq_printf(p, "  ELVIS PIs\n");	
 	seq_printf(p, "%*s: ", prec, "ELI");
 	for_each_online_cpu(j)
 		seq_printf(p, "%10u ", irq_stats(j)->irq_eli_count);
@@ -192,6 +196,12 @@ unsigned int __irq_entry do_IRQ(struct pt_regs *regs)
 	unsigned vector = ~regs->orig_ax;
 	unsigned irq;
 
+	if (vector == pi_notif_vector) {
+		inc_irq_stat(irq_eli_pis_count);
+		vector = *(pi_injected_vector + smp_processor_id());
+		*(pi_injected_vector + smp_processor_id()) = -1;
+		regs->orig_ax = ~vector;
+	}
 	irq_enter();
 	exit_idle();
 

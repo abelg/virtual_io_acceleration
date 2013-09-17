@@ -13,6 +13,9 @@
 #include <asm/mpspec.h>
 #include <asm/msr.h>
 
+extern int pi_notif_vector;
+extern int* pi_injected_vector;
+
 #define ARCH_APICTIMER_STOPS_ON_C3	1
 
 /*

@@ -24,6 +24,7 @@ typedef struct {
 	 */
 	unsigned int irq_tlb_count;
 	unsigned int irq_eli_count;
+	unsigned int irq_eli_pis_count;
 #endif
 #ifdef CONFIG_X86_THERMAL_VECTOR
 	unsigned int irq_thermal_count;
