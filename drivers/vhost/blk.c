@@ -24,6 +24,7 @@
 
 #include "vhost.h"
 #include "blk.h"
+#include <linux/idr.h>
 
 static DEFINE_IDA(vhost_blk_index_ida);
 
@@ -718,13 +719,11 @@ static struct miscdevice vhost_blk_misc = {
 
 static int vhost_blk_init(void)
 {
-        vhost_init();
 	return misc_register(&vhost_blk_misc);
 }
 
 static void vhost_blk_exit(void)
 {
-        vhost_exit();
 	misc_deregister(&vhost_blk_misc);
 }
 

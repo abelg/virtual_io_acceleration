@@ -11,6 +11,7 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_ring.h>
 #include <linux/virtio_blk.h>
+#include <linux/virtio_net.h>
 #include <linux/atomic.h>
 
 struct vhost_device;
@@ -43,6 +44,7 @@ struct vhost_poll {
 };
 
 void vhost_work_init(struct vhost_work *work, struct vhost_virtqueue *vq, vhost_work_fn_t fn);
+void vhost_work_flush(struct vhost_dev *dev, struct vhost_work *work);
 void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work);
 
 void vhost_poll_init(struct vhost_poll *poll, vhost_work_fn_t fn,
@@ -357,6 +359,4 @@ static inline int vhost_has_feature(struct vhost_dev *dev, int bit)
 
 void vhost_enable_zcopy(int vq);
 
-void vhost_init(void);
-void vhost_exit(void);
 #endif

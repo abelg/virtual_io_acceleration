@@ -50,7 +50,6 @@
 #include <linux/llist.h>
 #include <linux/bitmap.h>
 
-#include "vhost.c"
 #include "vhost.h"
 #include "tcm_vhost.h"
 

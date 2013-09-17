@@ -1033,7 +1033,6 @@ static int vhost_net_init(void)
 {
 	if (experimental_zcopytx)
 		vhost_enable_zcopy(VHOST_NET_VQ_TX);
-	vhost_init();
 	return misc_register(&vhost_net_misc);
 }
 module_init(vhost_net_init);
@@ -1041,7 +1040,6 @@ module_init(vhost_net_init);
 static void vhost_net_exit(void)
 {
 	misc_deregister(&vhost_net_misc);
-	vhost_exit();
 }
 module_exit(vhost_net_exit);
 
