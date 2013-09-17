@@ -3416,12 +3416,28 @@ static void vmx_get_cs_db_l_bits(struct kvm_vcpu *vcpu, int *db, int *l)
 
 static void vmx_get_idt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
 {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	/* if ELI is enabled returns the guest IDTR and not the shadow IDTR */
+	if (vmx->eli.enabled) {
+		dt->size = vmx->eli.guest_idt.size;
+		dt->address = vmx->eli.guest_idt.address;
+		return;
+	}
+	
 	dt->size = vmcs_read32(GUEST_IDTR_LIMIT);
 	dt->address = vmcs_readl(GUEST_IDTR_BASE);
 }
 
 static void vmx_set_idt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
 {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	/* if ELI is enabled set the guest IDTR and not the shadow IDTR */
+	if (vmx->eli.enabled) {
+		vmx->eli.guest_idt.size = dt->size;
+		vmx->eli.guest_idt.address = dt->address;
+		return;
+	}
+
 	vmcs_write32(GUEST_IDTR_LIMIT, dt->size);
 	vmcs_writel(GUEST_IDTR_BASE, dt->address);
 }
