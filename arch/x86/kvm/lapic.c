@@ -694,6 +694,9 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
 		/* FIXME add logic for vcpu on reset */
 		if (unlikely(!apic_enabled(apic)))
 			break;
+		if (kvm_send_interrupt(vcpu, delivery_mode, vector, 
+				       level, trig_mode))
+			break;
 
 		if (trig_mode) {
 			apic_debug("level trig mode for vector %d", vector);

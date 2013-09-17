@@ -733,6 +733,9 @@ struct kvm_x86_ops {
 			       enum x86_intercept_stage stage);
 	/* Remember mapping from guest vector to host irq */
 	void (*eli_remap_vector)(struct kvm_vcpu *vcpu, int guest_vector, int host_irq);
+	int (*send_posted_interrupt)(struct kvm_vcpu *vcpu, int delivery_mode,
+					int vector, int level, int trig_mode);
+	int (*has_posted_interrupts)(struct kvm_vcpu *vcpu);
 };
 
 struct kvm_arch_async_pf {

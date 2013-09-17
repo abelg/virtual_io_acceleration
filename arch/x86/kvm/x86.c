@@ -7005,6 +7005,15 @@ int kvm_arch_vcpu_should_kick(struct kvm_vcpu *vcpu)
 	return kvm_vcpu_exiting_guest_mode(vcpu) == IN_GUEST_MODE;
 }
 
+int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode) {
+	if (kvm_x86_ops->has_posted_interrupts(vcpu)) {
+		return kvm_x86_ops->send_posted_interrupt(vcpu, delivery_mode,
+						vector, level, trig_mode);
+	}
+	return 0;
+}
+
 int kvm_arch_interrupt_allowed(struct kvm_vcpu *vcpu)
 {
 	return kvm_x86_ops->interrupt_allowed(vcpu);

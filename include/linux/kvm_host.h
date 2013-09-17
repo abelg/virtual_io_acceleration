@@ -638,6 +638,14 @@ void kvm_arch_sync_events(struct kvm *kvm);
 int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu);
 void kvm_vcpu_kick(struct kvm_vcpu *vcpu);
 
+int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode);
+
+int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode);
+
+int kvm_resend_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode);
 bool kvm_is_mmio_pfn(pfn_t pfn);
 
 struct kvm_irq_ack_notifier {
