@@ -30,6 +30,7 @@
 
 #include "vhost.h"
 
+#include <linux/debugfs.h>
 #include <linux/moduleparam.h>
 static int devices_per_worker = 7;
 module_param(devices_per_worker, int, S_IRUGO);
@@ -65,6 +66,67 @@ MODULE_PARM_DESC(max_queue_stuck_cycles, "How many cycles need to elapse to cons
 static int max_queue_stuck_size = 0;
 module_param(max_queue_stuck_size, int, S_IRUGO|S_IWUSR);
 MODULE_PARM_DESC(max_queue_stuck_size, "The queue will be considered stuck as long as there are no more than this number of items (0=disabled)");
+
+#define QUEUE_STAT(x) offsetof(struct vhost_virtqueue, stats.x)
+#define WORKER_STAT(x) offsetof(struct vhost_worker, stats.x)
+#define NSTATS(x)  (sizeof(x) / sizeof(x[0]))
+
+struct vhost_stats_debugfs_item {
+	const char *name;
+	int offset;
+};
+
+
+/* worker statistics */
+struct vhost_stats_debugfs_item debugfs_worker_entries[] = {
+	{ "worker_loops", WORKER_STAT(loops) },
+	{ "worker_enabled_interrupts", WORKER_STAT(enabled_interrupts) },
+	{ "worker_cycles", WORKER_STAT(cycles) },
+	{ "worker_mm_switches", WORKER_STAT(switches) },
+	{ "worker_wait", WORKER_STAT(wait) },
+	{ "worker_empty_works", WORKER_STAT(empty_works) },
+	{ "worker_empty_polls", WORKER_STAT(empty_polls) },
+	{ "worker_stuck_works", WORKER_STAT(stuck_works) },
+	{ "worker_pending_works", WORKER_STAT(pending_works) },
+	{ "worker_noqueue_works", WORKER_STAT(noqueue_works) }
+};
+
+
+/* queue statistics */
+struct vhost_stats_debugfs_item debugfs_queue_entries[] = {
+	{ "queue_ring_full", QUEUE_STAT(ring_full) },
+	{ "queue_poll_kicks", QUEUE_STAT(poll_kicks) },
+	{ "queue_poll_cycles", QUEUE_STAT(poll_cycles) },
+	{ "queue_poll_bytes", QUEUE_STAT(poll_bytes) },
+	{ "queue_poll_wait", QUEUE_STAT(poll_wait) },
+	{ "queue_poll_empty", QUEUE_STAT(poll_empty) },
+	{ "queue_poll_empty_cycles", QUEUE_STAT(poll_empty_cycles) },
+	{ "queue_poll_coalesced", QUEUE_STAT(poll_coalesced) },
+	{ "queue_poll_limited", QUEUE_STAT(poll_limited) },
+	{ "queue_notif_works", QUEUE_STAT(notif_works) },
+	{ "queue_notif_cycles", QUEUE_STAT(notif_cycles) },
+	{ "queue_notif_bytes", QUEUE_STAT(notif_bytes) },
+	{ "queue_notif_wait", QUEUE_STAT(notif_wait) },
+	{ "queue_notif_limited", QUEUE_STAT(notif_limited) },
+	{ "queue_stuck_times", QUEUE_STAT(stuck_times) },
+	{ "queue_stuck_cycles", QUEUE_STAT(stuck_cycles) }
+};
+
+static int vhost_stat_get(void *data, u64 *val) {
+	struct stat_entry *entry = (struct stat_entry *)data;
+
+	*val = *((u64*)((long)entry->container+entry->offset));
+
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(vhost_stat_fops, vhost_stat_get, NULL, "%llu\n");
+
+struct dentry *vhost_debugfs_dir;
+
+#define QUEUE_STAT(x) offsetof(struct vhost_virtqueue, stats.x)
+#define WORKER_STAT(x) offsetof(struct vhost_worker, stats.x)
+
 enum {
 	VHOST_MEMORY_MAX_NREGIONS = 64,
 	VHOST_MEMORY_F_LOG = 0x1,
@@ -190,6 +252,7 @@ void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work)
 	spin_lock_irqsave(&dev->worker->work_lock, flags);
 	if (list_empty(&work->node)) {
 		list_add_tail(&work->node, &dev->worker->work_list);
+		dev->worker->stats.pending_works++;
 		work->queue_seq++;
 		wake_up_process(dev->worker->worker_thread);
 	}
@@ -201,6 +264,7 @@ void vhost_poll_queue(struct vhost_poll *poll)
 	vhost_work_queue(poll->dev, &poll->work);
 }
 
+static atomic_t last_vqid = ATOMIC_INIT(0);
 /* Enable or disable virtqueue polling (vqpoll.enabled) for a virtqueue.
  *
  * Enabling this mode it tells the guest not to notify ("kick") us when its
@@ -262,6 +326,8 @@ static void vhost_vq_disable_vqpoll(struct vhost_virtqueue *vq)
 		return; /* already disabled, nothing to do */
 	}
 	vq->vqpoll.enabled = false;
+	/* stop measuring cycles the queue was empty while polling */
+	vq->stats.last_poll_empty_tsc = 0;
 
 	if (!list_empty(&vq->vqpoll.link)) {
 		/* vq is on the polling list, remove it from this list and
@@ -325,8 +391,10 @@ static void vhost_vq_reset(struct vhost_dev *dev,
  */
 static inline void set_mm(struct vhost_virtqueue *vq) {
 	struct mm_struct *mm = vq->dev->mm;
-	if (current->mm != mm)
+	if (current->mm != mm) {
 		use_mm(mm);
+		vq->dev->worker->stats.switches++;
+	}
 }
 
 /* roundrobin_poll() takes worker->vqpoll_list, and returns one of the
@@ -351,16 +419,32 @@ static struct vhost_virtqueue *roundrobin_poll(struct list_head *list) {
 	list_move_tail(&vq->vqpoll.link, list);
 
 	/* If poll_coalescing is set, avoid kicking the same vq too often */
-	if (jiffies - vq->vqpoll.jiffies_last_kick < poll_coalescing)
+	if (jiffies - vq->vqpoll.jiffies_last_kick < poll_coalescing) {
+		vq->stats.poll_coalesced++;
 		return NULL;
+	}
 
 	/* See if there is any new work available from the guest. */
 	/* TODO: need to check the optional idx feature, and if we haven't
 	 * reached that idx yet, don't kick... */
 	avail_idx = vq->vqpoll.avail_mapped->idx;
 	if (avail_idx != vq->last_avail_idx) {
+		/* if the list was empty in previous polls calculated
+		   the cycles elapsed until we detected work */
+		if (vq->stats.last_poll_empty_tsc != 0) {
+			u64 tsc;
+			rdtscll(tsc);
+			vq->stats.poll_empty_cycles+=(tsc-vq->stats.last_poll_empty_tsc);
+			vq->stats.last_poll_empty_tsc = 0;
+		}
 		return vq;
 	}
+	vq->stats.poll_empty++;
+	/* Remember the first time the queue was empty to measure the amount
+	   of cycles elasped until we detect work */
+	if (vq->stats.last_poll_empty_tsc == 0)
+		rdtscll(vq->stats.last_poll_empty_tsc);
+
 	if (jiffies > vq->vqpoll.jiffies_last_kick + poll_stop_idle) {
 		/* We've been polling this virtqueue for a long time with no
 		 * results, so switch back to guest notification
@@ -398,6 +482,7 @@ bool vhost_can_continue(struct vhost_virtqueue  *vq, size_t processed_data, size
 	elapsed_cycles = cycles - vq->dev->worker->last_work_tsc;
 	// if there are work items pending for too long we can not continue
 	if (max_work_stuck_cycles>=0 && elapsed_cycles>max_work_stuck_cycles && !list_empty(&vq->dev->worker->work_list)) {
+		vq->dev->worker->stats.stuck_works++;
 		return false;
 	}
 
@@ -438,6 +523,8 @@ bool vhost_can_continue(struct vhost_virtqueue  *vq, size_t processed_data, size
 
 					// put stuck queue in the 1st place if it's being polled
 					list_move(&vq_iterator->vqpoll.link, list);
+					vq_iterator->stats.stuck_times++;
+					vq_iterator->stats.stuck_cycles+=elapsed_cycles;
 					return false;
 				}
 			} else {
@@ -461,6 +548,10 @@ static int vhost_worker_thread(void *data)
 	set_fs(USER_DS);
 
 	for (;;) {
+		u64 loop_start_tsc, loop_end_tsc,
+			poll_start_tsc = 0, poll_end_tsc = 0,
+			work_start_tsc = 0, work_end_tsc = 0;
+		rdtscll(loop_start_tsc);
 		/* mb paired w/ kthread_stop */
 		set_current_state(TASK_INTERRUPTIBLE);
 
@@ -480,6 +571,7 @@ static int vhost_worker_thread(void *data)
 			work = list_first_entry(&worker->work_list,
 					struct vhost_work, node);
 			list_del_init(&work->node);
+			worker->stats.pending_works--;
 			seq = work->queue_seq;
 		} else
 			work = NULL;
@@ -492,9 +584,25 @@ static int vhost_worker_thread(void *data)
 				spin_unlock_irq(&worker->work_lock);
 				break;
 			}
-			if (vq)
+			if (vq) {
 				set_mm(vq);
-			work->fn(work);
+				if (vq->avail && (vq->last_avail_idx == vq->avail->idx+1))
+					vq->stats.ring_full++;
+				vq->stats.handled_bytes = 0;
+				vq->stats.was_limited = 0;
+				rdtscll(work_start_tsc);
+				work->fn(work);
+				rdtscll(work_end_tsc);
+				vq->stats.notif_cycles+=(work_end_tsc-work_start_tsc);                  
+				if (likely(vq->stats.notif_works++ > 0))
+					vq->stats.notif_wait+=(work_start_tsc-vq->stats.last_notif_tsc_end);
+				vq->stats.last_notif_tsc_end = work_end_tsc;
+				vq->stats.notif_bytes+=vq->stats.handled_bytes;
+				vq->stats.notif_limited+=vq->stats.was_limited;
+			} else {
+				work->fn(work);
+				worker->stats.noqueue_works++;
+			}
 			rdtscll(worker->last_work_tsc);
 			/* Keep track of the work rate, for deciding when to
 			 * enable polling */
@@ -524,7 +632,8 @@ static int vhost_worker_thread(void *data)
 					poll_start_rate) {
 				vhost_vq_enable_vqpoll(vq);
 			}
-		}
+		} else
+			worker->stats.empty_works++;
 
 		/* Check one virtqueue from the round-robin list */
 		if (!list_empty(&worker->vqpoll_list)) {
@@ -532,14 +641,37 @@ static int vhost_worker_thread(void *data)
 			vq = roundrobin_poll(&worker->vqpoll_list);
 			if (vq) {
 				set_mm(vq);
+				if (vq->avail && vq->last_avail_idx == vq->avail->idx +1 )
+					vq->stats.ring_full++;
+				vq->stats.handled_bytes = 0;
+				vq->stats.was_limited = 0;
+				rdtscll(poll_start_tsc);
 				vq->handle_kick(&vq->poll.work);
+				rdtscll(poll_end_tsc);
+				vq->stats.poll_cycles+=(poll_end_tsc-poll_start_tsc);
+				if (likely(vq->stats.poll_kicks++ > 0))
+					vq->stats.poll_wait+=(poll_start_tsc-vq->stats.last_poll_tsc_end);
+				vq->stats.last_poll_tsc_end = poll_end_tsc;
+				vq->stats.poll_bytes+=vq->stats.handled_bytes;
+				vq->stats.poll_limited+=vq->stats.was_limited;
 				vq->vqpoll.jiffies_last_kick=jiffies;
+			}
+			else {
+				worker->stats.empty_polls++;
 			}
 			/* If our polling list isn't empty, ask to continue
 			 * running this thread, don't yield.
 			 */
 			__set_current_state(TASK_RUNNING);
 		}
+              
+		rdtscll(loop_end_tsc);          
+		worker->stats.cycles+=(loop_end_tsc-loop_start_tsc)
+			-(work_end_tsc-work_start_tsc)
+			-(poll_end_tsc-poll_start_tsc);
+		if (likely(worker->stats.loops++ > 0))
+			worker->stats.wait+=(loop_start_tsc-worker->stats.last_loop_tsc_end);
+		worker->stats.last_loop_tsc_end = loop_end_tsc;
 		if (need_resched())
 			schedule();
 	}
@@ -563,16 +695,102 @@ void vhost_enable_zcopy(int vq)
 {
 	vhost_zcopy_mask |= 0x1 << vq;
 }
+static void vhost_init_statistics(void) {
+	vhost_debugfs_dir = debugfs_create_dir("vhost", NULL);
+}
+
+static void vhost_exit_statistics(void) {
+	debugfs_remove(vhost_debugfs_dir);
+}
+
+/* create files in debugfs for vhost statistics */
+static struct stat_entry* vhost_create_stats_entries(void* container,
+						     struct dentry* dir_entry,
+						     struct vhost_stats_debugfs_item stats[],
+						     int num_stats ) {
+	struct stat_entry* entries;
+	struct vhost_stats_debugfs_item *p;
+	int i;
+
+	entries = (struct stat_entry*)
+		kmalloc(sizeof(struct stat_entry)*num_stats,
+			GFP_KERNEL);
+
+	p = stats;
+	for (i = 0; i < num_stats; i++) {
+		entries[i].offset = p->offset;
+		entries[i].container = container;
+	        entries[i].debugfs_file = debugfs_create_file(p->name, 0444, dir_entry,
+						entries+i,
+						&vhost_stat_fops);
+
+		*((u64*)((long)container+p->offset)) = 0;
+		p++;
+	}
+
+	return entries;
+}
+
+static void vhost_remove_stats_entries(struct stat_entry* entries, int num_stats) {
+	int i;
+	for (i = 0; i < num_stats; i++)
+		debugfs_remove(entries[i].debugfs_file);
+	
+	kfree(entries);
+}
+
+static void vhost_init_worker_statistics(struct vhost_worker* worker) {
+	char worker_name[255];	
+	sprintf (worker_name, "worker-%d", worker->id);
+
+	worker->stats.debugfs_dir = 
+		debugfs_create_dir(worker_name, vhost_debugfs_dir);
+
+	worker->stats.entries = vhost_create_stats_entries(worker,
+							   worker->stats.debugfs_dir,
+							   debugfs_worker_entries,
+							   NSTATS(debugfs_worker_entries));
+}
+
+static void vhost_exit_worker_statistics(struct vhost_worker* worker) {
+	vhost_remove_stats_entries(worker->stats.entries,
+				 NSTATS(debugfs_worker_entries));
+	debugfs_remove(worker->stats.debugfs_dir);
+}
+
+static void vhost_init_queue_statistics(struct vhost_virtqueue* vq) {
+	char queue_name[255];
+	int devid = vq->dev->id;
+	int vqid = vq - vq->dev->vqs;
+	
+	sprintf (queue_name, "dev-%d_queue-%d", devid, vqid);
+
+	vq->stats.debugfs_dir =
+		debugfs_create_dir(queue_name, vhost_debugfs_dir);
+	
+	vq->stats.entries= vhost_create_stats_entries(vq,
+						      vq->stats.debugfs_dir,
+						      debugfs_queue_entries,
+						      NSTATS(debugfs_queue_entries));
+}
+
+static void vhost_exit_queue_statistics(struct vhost_virtqueue* vq) {
+	vhost_remove_stats_entries(vq->stats.entries,
+				 NSTATS(debugfs_queue_entries));
+	debugfs_remove(vq->stats.debugfs_dir);
+}
 
 void vhost_init(void)
 {
 	workers_pool.num_devices_per_worker = devices_per_worker;
 	spin_lock_init(&workers_pool.workers_lock);
 	INIT_LIST_HEAD(&workers_pool.workers_list);
+	vhost_init_statistics();
 }
 
 void vhost_exit(void)
 {
+	vhost_exit_statistics();
 }
 
 
@@ -632,6 +850,7 @@ static void vhost_dev_assign_worker(struct vhost_dev *dev)
 		worker = kmalloc(sizeof *worker, GFP_KERNEL);
 		worker->id = ++workers_pool.last_worker_id;
 		worker->num_devices = 0;
+		vhost_init_worker_statistics(worker);
 		spin_lock_init(&worker->work_lock);
 		INIT_LIST_HEAD(&worker->work_list);		
 		list_add(&worker->node, &workers_pool.workers_list);
@@ -666,6 +885,8 @@ long vhost_dev_init(struct vhost_dev *dev,
 	dev->memory = NULL;
 	dev->mm = NULL;
 	vhost_dev_assign_worker(dev);
+	dev->id = atomic_inc_return(&last_vqid);
+
 
 	for (i = 0; i < dev->nvqs; ++i) {
 		dev->vqs[i].log = NULL;
@@ -673,6 +894,7 @@ long vhost_dev_init(struct vhost_dev *dev,
 		dev->vqs[i].heads = NULL;
 		dev->vqs[i].ubuf_info = NULL;
 		dev->vqs[i].dev = dev;
+		vhost_init_queue_statistics(dev->vqs+i);
 		mutex_init(&dev->vqs[i].mutex);
 		vhost_vq_reset(dev, dev->vqs + i);
 		if (dev->vqs[i].handle_kick)
@@ -818,6 +1040,7 @@ void vhost_dev_cleanup(struct vhost_dev *dev, bool locked)
 		// still have its mm as its current mm. We will never use it
 		// again (before the next work, we switch mm again) but maybe
 		// holding it wastes memory?
+		vhost_exit_queue_statistics(dev->vqs+i);
 		vhost_vq_reset(dev, dev->vqs + i);
 	}
 	vhost_dev_free_iovecs(dev);
@@ -848,6 +1071,10 @@ void vhost_dev_cleanup(struct vhost_dev *dev, bool locked)
 		spin_unlock_irq(&workers_pool.workers_lock);
 		// avoid the following, the device might still use worker lock
 		// dev->worker = NULL;
+		if (dev->worker->num_devices == 0) {
+			vhost_exit_worker_statistics(dev->worker);
+			kfree(dev->worker);
+		}
 	}
 	// TODO: maybe we need to copy dev->mm, zero it, and only then mmput,
 	// to ensure we don't mm_use it again?

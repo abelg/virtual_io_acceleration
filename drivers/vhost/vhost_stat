@@ -1,0 +1,155 @@
+#!/usr/bin/python
+
+import curses
+import sys, os, time, optparse
+
+class Stats:
+    def __init__(self, fields = None):
+        def wanted(key):
+            import re
+            if not fields:
+                return True
+            return re.match(fields, key) != None
+
+        def populate(self, fchar, stats):
+            def filterfx(f): return f[0]==fchar
+            for dir in filter(filterfx, os.listdir(self.base)):
+                files = {}
+                for f in os.listdir(self.base + dir):
+                    if wanted(f):
+                        files[f] = None
+                stats[dir] = files
+                        
+        self.base = '/sys/kernel/debug/vhost/'
+        self.workers_stats = {}
+        self.queues_stats = {}
+        # get workers        
+        populate(self, 'w', self.workers_stats)
+        # get queues
+        populate(self, 'd', self.queues_stats)
+
+    def get(self, stats):
+        values = {}
+        for dir, files in stats.iteritems():
+            for f, oldval in files.iteritems():
+                newval = int(file(self.base + dir + "/" + f).read())
+                newdelta = None
+                files[f] = newval
+                if oldval is not None:
+                    newdelta = newval - oldval
+                if not f in values:
+                    values[f] = [[newval, newdelta, dir]]
+                else:
+                    values[f].append([newval, newdelta, dir])
+        return values
+
+if not os.access('/sys/kernel/debug', os.F_OK):
+    print 'Please enable CONFIG_DEBUG_FS in your kernel'
+    sys.exit(1)
+if not os.access('/sys/kernel/debug/vhost', os.F_OK):
+    print "Please mount debugfs ('mount -t debugfs debugfs /sys/kernel/debug')"
+    print "and ensure the vhost module is loaded"
+    sys.exit(1)
+
+label_width = 26
+
+def tui(screen, get_stats):
+    curses.use_default_colors()
+    curses.noecho()
+    def refresh():
+        screen.erase()
+        screen.addstr(0, 0, 'vhost statistics')
+        col = label_width        
+        s = get_stats()
+        for key in sorted(s.keys()):
+            row = 2
+            if col+15+5 >= screen.getmaxyx()[1]:
+                break
+            values = s[key]
+            screen.addstr(1, col, key)
+            screen.addstr(1, col+label_width-1, '|')
+            for value in values:
+                if row>=screen.getmaxyx()[0]:
+                    break
+                if col==label_width:
+                    screen.addstr(row, 0, str(value[2]))
+                if value[1] is not None:
+                        screen.addstr(row, col, '%15d' % (value[0],))
+                        screen.addstr(row, col+15, '%10d' % (value[1],))
+                        screen.addstr(row, col+15+10, '|')
+                        pass
+                row += 1
+            col +=label_width
+        screen.refresh()
+
+    while True:
+        refresh()
+        curses.halfdelay(10)
+        try:
+            c = screen.getkey()
+            if c == 'q':
+                break
+        except KeyboardInterrupt:
+            break
+        except curses.error:
+            continue
+
+def log(get_stats,wanted):
+    
+    def banner():
+        stats = get_stats()
+        for stat in sorted(stats.keys()):
+            print '%29s' % stat[0:26] + '|',
+        print
+    def statline():
+        stats = get_stats()
+        for stat in sorted(stats.keys()):
+            for values in stats[stat]:
+                if values[2]==wanted:
+                    print ' %15d' % values[0],
+                    print ' %10d' % values[1],
+                    print '|',
+        print
+    line = 0
+    banner_repeat = 20
+    while True:
+        time.sleep(1)
+        if line % banner_repeat == 0:
+            banner()
+        statline()
+        line += 1
+
+options = optparse.OptionParser()
+options.add_option('-l', '--log',
+                   action = 'store',
+                   default = False,
+                   dest = 'log',
+                   help = 'run in logging mode (like vmstat) for the given worker or queue (only one supported)',
+                   )
+options.add_option('-f', '--fields',
+                   action = 'store',
+                   default = None,
+                   dest = 'fields',
+                   help = 'fields to display (regex)',
+                   )
+options.add_option('-w', '--workers',
+                   action = 'store_true',
+                   default = False,
+                   dest = 'workers',
+                   help = 'display worker statistics instead of queues statistics',
+                   )
+(options, args) = options.parse_args(sys.argv)
+
+stats = Stats(fields = options.fields)
+
+if options.workers:
+    get_stats = lambda: stats.get(stats.workers_stats)
+else:
+    get_stats = lambda: stats.get(stats.queues_stats)
+
+if options.log:
+    log(get_stats, options.log)
+else:
+    import curses.wrapper
+    curses.wrapper(tui, get_stats)
+

@@ -67,6 +67,11 @@ struct vhost_ubuf_ref {
 struct vhost_ubuf_ref *vhost_ubuf_alloc(struct vhost_virtqueue *, bool zcopy);
 void vhost_ubuf_put(struct vhost_ubuf_ref *);
 void vhost_ubuf_put_and_wait(struct vhost_ubuf_ref *);
+struct stat_entry {
+	struct dentry* debugfs_file; /* points to the debugfs file entry */
+	void* container; /* point to the memory structure containing the stat value */
+	int offset; /* offset in the memory structure where the value is located */
+};
 
 struct ubuf_info;
 
@@ -145,6 +150,36 @@ struct vhost_virtqueue {
 	 * Protected by vq mutex. Writers must also take device mutex. */
 	struct vhost_ubuf_ref *ubufs;
 	struct {
+		u64 poll_kicks; /* number of kicks in poll mode */
+		u64 poll_cycles; /* cycles spent handling kicks in poll mode*/;
+		u64 poll_bytes; /* bytes sent/received by kicks in poll mode */
+		u64 poll_wait; /* cycles elapsed between poll kicks */
+		u64 poll_empty; /* number of times the queue was empty during poll */
+		u64 poll_empty_cycles; /* number of cycles elapsed while the queue was empty */
+		u64 poll_coalesced; /* number of times this queue was coaelesced */
+		u64 poll_limited; /* number of times the queue was limited by netweight during poll kicks*/
+		
+		u64 notif_works; /* number of worls in notif mode */
+		u64 notif_cycles; /* cycles spent handling works in notif mode */
+		u64 notif_bytes; /* bytes sent/received by works in notif mode */
+		u64 notif_wait; /* cycles elapsed between works in notif mode */
+		u64 notif_limited; /* number of times the queue was limited by netweight in notif mode */
+
+		u64 ring_full; /* number of times the ring was full */
+
+		u64 stuck_times; /* how many times this queue was stuck and limited other queues */
+		u64 stuck_cycles; /* total amount of cycles the queue was stuck */
+
+		u64 last_poll_tsc_end; /* tsc when the last poll finished */
+		u64 last_notif_tsc_end; /* tsc when the last notif finished */
+		u64 last_poll_empty_tsc; /* tsc when the queue was detected empty for the first time */
+		u64 handled_bytes; /* number of bytes handled by this queue in the last poll/notif. Must beupdated by the concrete vhost implementations (vhost-net)*/
+		u64 was_limited; /* flag indicating if the queue was limited by net-weight during the last poll/notif. Must beupdated by the concrete vhost implementations (vhost-net)*/
+
+		struct dentry *debugfs_dir; /* root entry in debugfs for the queue statistics */
+		struct stat_entry *entries; /* files created in the queue root entry */
+	} stats;
+	struct {
 		/* When a virtqueue is in vqpoll.enabled mode, it declares
 		 * that instead of using guest notifications (kicks) to
 		 * discover new work, we prefer to continuously poll this
@@ -205,6 +240,7 @@ struct vhost_dev {
 	struct file *log_file;
 	struct eventfd_ctx *log_ctx;
 	struct vhost_worker *worker;
+	int id;
 };
 struct vhost_worker {
 	spinlock_t work_lock;
@@ -219,6 +255,23 @@ struct vhost_worker {
 	struct list_head node;
 	/* tsc when the last work was processed from the work_list */
 	u64 last_work_tsc;
+	struct {
+		u64 loops; /* number of loops performed */
+		u64 enabled_interrupts; /* number of times interrupts were re-enabled */
+		u64 cycles; /* cycles spent in the worker, excluding cycles doing queue work */
+		u64 switches; /* number of times the mm was  switched */
+		u64 wait; /* number of cycles the worker thread was not running after schedule */
+		u64 empty_works; /* number of times there were no works in the queue -- ignoring poll kicks  */
+		u64 empty_polls; /* number of times there were no queues to poll and the polling queue was not empty  */
+		u64 stuck_works; /* number of times were detected stuck and limited queues */
+		u64 noqueue_works; /* number of works which have no queue related to them (e.g. vhost-net rx) */
+		u64 pending_works; /* number of pending works */;
+
+		u64 last_loop_tsc_end; /* tsc when the last loop was performed */
+
+		struct dentry *debugfs_dir; /* root entry in debugfs for the worker statistics */
+		struct stat_entry *entries; /* files created in the queue root entry */
+	} stats;
 	struct list_head vqpoll_list;
 };
 
