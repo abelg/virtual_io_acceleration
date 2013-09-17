@@ -5415,6 +5415,64 @@ static void eli_remap(struct vcpu_vmx *vmx) {
 					vmx->eli.remap_gv_to_hirq[i]);
 	}
 }
+#define DI_IDT_VECTORS 256
+
+/* Enable ExitLess interrupt delivery */
+static int eli_enable(struct vcpu_vmx *vmx) {
+	int i;
+	bool setup_idt;
+	struct kvm_vcpu *vcpu;
+	
+	if (vmx->eli.enabled) {
+		return 0;
+	}
+
+	/* ELI can not be enabled if it was not previouslly initialized */
+	if (!vmx->eli.host_idt.address) {
+		return 0;
+	}
+	
+	/* keep the VMCS guest IDTR fields in-memory */
+	vmx_get_idt(&(vmx->vcpu), &vmx->eli.guest_idt);
+	/* set the shadow IDT size according to the guest IDT size */
+	vmx->eli.host_idt.size = vmx->eli.guest_idt.size;
+
+	/* setup idt if this is the first vcpu to enable eli */
+	setup_idt = true;
+	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
+		if (to_vmx(vcpu)->eli.enabled) {
+			setup_idt = false;
+			break;
+		}
+	}	
+	if (setup_idt) {
+		/* copy guest idt to shadow idt, but for all vectors used
+		   for external interrupts (>=32, !=0x80) set present=0 to
+		   cause an exit back to the host.
+		 */
+		for (i = 0; i < DI_IDT_VECTORS; i++)
+			eli_copy_idt_entry(vmx, i, i,
+			  i>=FIRST_EXTERNAL_VECTOR && i !=IA32_SYSCALL_VECTOR);
+	}
+	vmx->eli.enabled = true;
+	/* turn off injection off */
+	vmx->eli.inject_mode = true;
+	eli_set_inject_mode(vmx, false);
+	return 1;
+}
+
+/* disable ExitLess interrupt delivery */
+static int eli_disable(struct vcpu_vmx *vmx) {
+	if (vmx->eli.host_idt.size == 0) {
+		return 0;
+	}
+
+	/* set injection mode true and disable ELI */
+	eli_set_inject_mode(vmx, true);
+	vmx->eli.enabled = false;
+
+	return 1;
+}
 int is_eoi(struct vcpu_vmx *vmx) {
 	/* check for x2APIC */
 	if (apic_x2apic_mode(vmx->vcpu.arch.apic))
@@ -5477,6 +5535,9 @@ static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 }
 
 #define DI_INITIALIZE             300
+/* hypercalls used to start/stop ExitLess interrupt delivery */
+#define DI_START                  500
+#define DI_STOP                   600
 /* hypercalls used to start/stop ExitLess interrupt completion (EOI) */
 #define DI_START_EOI             1101
 #define DI_STOP_EOI              1201
@@ -5489,6 +5550,15 @@ static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 	case DI_INITIALIZE:
 		eli_init_all(vmx,
 			(gva_t) kvm_register_read(&vmx->vcpu, VCPU_REGS_RBX));
+		break;
+	case DI_START:
+		/* enable ExitLess interrupt delivery and remap guest/host vectors */
+		eli_enable(vmx);
+		eli_remap(vmx);
+		break;
+	case DI_STOP:
+		/* disable ExitLess interrupt delivery */
+		eli_disable(vmx);
 		break;
 	case DI_START_EOI:
 		/* enable ExitLess interrupt completion */
