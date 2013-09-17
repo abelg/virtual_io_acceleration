@@ -531,6 +531,33 @@ static int assign_guest_irq(struct kvm *kvm,
 	return r;
 }
 
+#include <asm/msidef.h>
+static void remap_guest_host(struct kvm *kvm, int guest_irq, int host_irq){
+	int guestv;
+	struct kvm_irq_routing_table *irq_rt;
+	struct kvm_kernel_irq_routing_entry *e;
+
+	/* Convert guest gsi into vector: */
+	rcu_read_lock();
+	irq_rt = rcu_dereference(kvm->irq_routing);
+	if (guest_irq >= irq_rt->nr_rt_entries) {
+		return;
+	}
+	guestv=-1;
+	hlist_for_each_entry(e, &irq_rt->map[guest_irq], link)
+		if(e->type == KVM_IRQ_ROUTING_MSI)
+			guestv= (e->msi.data & MSI_DATA_VECTOR_MASK)
+					>> MSI_DATA_VECTOR_SHIFT;
+	rcu_read_unlock();
+	if (guestv==-1) {
+		return;
+	}
+
+	/* Finally, found the host and guest vector. Remember this
+	 * mapping
+	 */
+	kvm_arch_eli_remap_vector(kvm, guestv, host_irq);
+}
 /* TODO Deal with KVM_DEV_IRQ_ASSIGNED_MASK_MSIX */
 static int kvm_vm_ioctl_assign_irq(struct kvm *kvm,
 				   struct kvm_assigned_irq *assigned_irq)
@@ -569,6 +596,17 @@ static int kvm_vm_ioctl_assign_irq(struct kvm *kvm,
 
 	if (guest_irq_type)
 		r = assign_guest_irq(kvm, match, assigned_irq, guest_irq_type);
+	/* Remember the mapping between the host and guest vectors */
+	if (host_irq_type == KVM_DEV_IRQ_HOST_MSIX) {
+		int i;
+		for (i=0; i < match->entries_nr; i++) {
+			remap_guest_host(kvm,
+				match->guest_msix_entries[i].vector,
+				match->host_msix_entries[i].vector);
+		}
+	} else { /* MSI (or INTx) */
+		remap_guest_host(kvm, match->guest_irq, match->host_irq);
+	}
 out:
 	mutex_unlock(&kvm->lock);
 	return r;
