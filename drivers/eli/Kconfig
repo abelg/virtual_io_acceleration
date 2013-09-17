@@ -1,0 +1,10 @@
+config ELI_GUEST
+	tristate "ELI guest kernel accelerator - shadow IDT"
+	depends on X86
+        default n
+	---help---
+	  This kernel module can be loaded in guest kernel to accelerate
+	  guest I/O performance with ELI.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called eli.

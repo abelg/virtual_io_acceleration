@@ -32,6 +32,7 @@ obj-y				+= amba/
 obj-$(CONFIG_DMADEVICES)	+= dma/
 
 obj-$(CONFIG_VIRTIO)		+= virtio/
+obj-$(CONFIG_ELI_GUEST)         += eli/
 obj-$(CONFIG_XEN)		+= xen/
 
 # regulators early, since some subsystems rely on them to initialize
