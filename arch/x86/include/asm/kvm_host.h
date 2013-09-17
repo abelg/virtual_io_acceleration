@@ -730,6 +730,8 @@ struct kvm_x86_ops {
 	int (*check_intercept)(struct kvm_vcpu *vcpu,
 			       struct x86_instruction_info *info,
 			       enum x86_intercept_stage stage);
+	/* Remember mapping from guest vector to host irq */
+	void (*eli_remap_vector)(struct kvm_vcpu *vcpu, int guest_vector, int host_irq);
 };
 
 struct kvm_arch_async_pf {

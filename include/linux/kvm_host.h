@@ -1013,6 +1013,8 @@ static inline long kvm_vm_ioctl_assigned_device(struct kvm *kvm, unsigned ioctl,
 
 #endif
 
+void kvm_arch_eli_remap_vector(struct kvm *kvm,
+	int guest_vector, int host_vector);
 static inline void kvm_make_request(int req, struct kvm_vcpu *vcpu)
 {
 	set_bit(req, &vcpu->requests);

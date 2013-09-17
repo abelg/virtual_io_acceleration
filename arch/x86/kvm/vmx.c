@@ -447,6 +447,14 @@ struct vcpu_vmx {
 		gpa_t host_idt_gpa;
 		/* Indicates if ELI is enabled or not */
 		bool enabled;
+		/*
+		 * The guest and host use different vectors for the assigned
+		 * device interrupts. This field is used to remap the vectors
+		 * of the shadow IDT so they point to the corresponding
+		 * handler in the guest.
+		 */
+		int remap_gv_to_hirq[256];
+		int remap_gv_to_hv[256];
 	} eli;
 };
 
@@ -4885,6 +4893,52 @@ static int handle_halt(struct kvm_vcpu *vcpu)
 	return kvm_emulate_halt(vcpu);
 }
 
+/*
+ * Copy entry number "guest_vector" from the guest IDT to entry number
+ * "host_vector" in the shadow IDT.
+ */
+static void eli_copy_idt_entry(struct vcpu_vmx *vmx,
+			      int guest_vector, unsigned host_vector,
+			      bool setNotPresent) {
+	struct desc_struct   idt_entry32;
+	struct gate_struct64 idt_entry64;
+	gva_t entry_addr;
+	struct x86_exception error;
+
+	/* 64 bit or 32 bit ? */
+	if (is_long_mode(&vmx->vcpu)) {
+		/* read guest idt entry */
+		entry_addr = vmx->eli.guest_idt.address +
+				guest_vector*sizeof(idt_entry64);
+		kvm_read_guest_virt_system(&vmx->vcpu.arch.emulate_ctxt,
+					   entry_addr, &idt_entry64,
+					   sizeof(idt_entry64), &error);
+		/* write shadow idt entry */
+		entry_addr = vmx->eli.host_idt.address +
+				host_vector*sizeof(idt_entry64);
+		if (setNotPresent)
+			idt_entry64.p = 0;
+		kvm_write_guest_virt_system(&vmx->vcpu.arch.emulate_ctxt,
+					    entry_addr, &idt_entry64,
+					    sizeof(idt_entry64), &error);
+	} else {
+		/* read guest idt entry */
+		entry_addr = vmx->eli.guest_idt.address +
+				guest_vector*sizeof(idt_entry32);
+		kvm_read_guest_virt_system(&vmx->vcpu.arch.emulate_ctxt,
+					   entry_addr, &idt_entry32,
+					   sizeof(idt_entry32), &error);
+		/* write shadow idt entry */
+		entry_addr = vmx->eli.host_idt.address +
+				host_vector*sizeof(idt_entry32);
+		if (setNotPresent)
+			idt_entry32.p = 0;
+		kvm_write_guest_virt_system(&vmx->vcpu.arch.emulate_ctxt,
+					    entry_addr, &idt_entry32,
+					    sizeof(idt_entry32), &error);
+	}
+}
+
 /* eli_init initializes ELI (Exit-Less Interrupts) for this vcpu, by
  * remembering the given location (GVA) for the shadow IDT.
  * The contents (and size) of the shadow IDT will only be filled later,
@@ -4917,6 +4971,67 @@ static void eli_init_all(struct vcpu_vmx *vmx, gva_t gva)
 	}
 }
 
+static int irq_to_vector(unsigned host_irq) {
+	int v;
+	for (v = 0; v < 256; v++ ) {		
+		int irq = __get_cpu_var(vector_irq)[v];
+		if (irq == host_irq)
+			return v;
+	}
+	return -1;
+}
+
+/* Remember to change the host-vector entry in the shadow IDT to point
+ * to the handler used by the entry guest-vector in the guest IDT once
+ * ELI is enabled.
+ */
+static void vmx_eli_remap_vector(struct kvm_vcpu *vcpu,
+					int guest_vector, int host_irq) {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int prev_host_vector, host_vector;
+
+	if (guest_vector<0 || guest_vector>=256 ||
+		host_irq<=0 || host_irq>=256){
+		return; /* shouldn't happen */
+	}
+
+	/* map the guest vector to the given host IRQ */
+	vmx->eli.remap_gv_to_hirq[guest_vector] = host_irq;
+	
+	if (!vmx->eli.enabled) {
+		/*
+		 * The guest (shadow) IDT isn't yet set up, so we cannot set
+		 * up the right entries yet. We keep the mapping in the
+		 * remap_gv_to_hirq (above), and "replay" them in eli_remap().
+		 */
+		return;
+	}
+
+	/* if the vector was previouslly remapped restore the original entry */
+	prev_host_vector = vmx->eli.remap_gv_to_hv[guest_vector];
+	if (prev_host_vector)
+		eli_copy_idt_entry(vmx, prev_host_vector, prev_host_vector,
+					false);
+	/* remap the shadow idt */
+	host_vector = irq_to_vector(host_irq);
+	if (host_vector < 0) {
+		printk(KERN_ERR "kvm-eli: could not find vector for host irq = %d corresponding to guest vector=%d\n",
+		       host_irq, guest_vector);
+		return;
+	}
+		
+	eli_copy_idt_entry(vmx, guest_vector, host_vector, false);
+	vmx->eli.remap_gv_to_hv[guest_vector] = host_vector;
+}
+/* Remap all the vectors saved by previous calls to vmx_eli_remap_vector. */
+static void eli_remap(struct vcpu_vmx *vmx) {
+	int i;
+	for (i=0; i<256; i++) {
+		if (vmx->eli.remap_gv_to_hirq[i]!=0)
+			vmx_eli_remap_vector(&vmx->vcpu, i,
+					vmx->eli.remap_gv_to_hirq[i]);
+	}
+}
 #define DI_INITIALIZE             300
 
 static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
@@ -7678,6 +7793,8 @@ static struct kvm_x86_ops vmx_x86_ops = {
 	.invpcid_supported = vmx_invpcid_supported,
 
 	.set_supported_cpuid = vmx_set_supported_cpuid,
+
+	.eli_remap_vector = vmx_eli_remap_vector,
 
 	.has_wbinvd_exit = cpu_has_vmx_wbinvd_exit,
 

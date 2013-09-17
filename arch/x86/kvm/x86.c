@@ -7193,3 +7193,11 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_nested_intr_vmexit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_invlpga);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_skinit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_nested_intercepts);
+void kvm_arch_eli_remap_vector(struct kvm *kvm,
+	int guest_vector, int host_irq)
+{
+	unsigned int i;
+	struct kvm_vcpu *vcpu;
+	kvm_for_each_vcpu(i, vcpu, kvm)
+		kvm_x86_ops->eli_remap_vector(vcpu, guest_vector, host_irq);
+}

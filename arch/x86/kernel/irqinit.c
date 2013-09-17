@@ -14,6 +14,7 @@
 #include <linux/acpi.h>
 #include <linux/io.h>
 #include <linux/delay.h>
+#include <linux/module.h>
 
 #include <linux/atomic.h>
 #include <asm/timer.h>
@@ -54,6 +55,7 @@ static struct irqaction irq2 = {
 DEFINE_PER_CPU(vector_irq_t, vector_irq) = {
 	[0 ... NR_VECTORS - 1] = -1,
 };
+EXPORT_PER_CPU_SYMBOL(vector_irq);
 
 int vector_used_by_percpu_irq(unsigned int vector)
 {
