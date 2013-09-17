@@ -1283,6 +1283,7 @@ static u32 vmx_read_guest_seg_ar(struct vcpu_vmx *vmx, unsigned seg)
 static void update_exception_bitmap(struct kvm_vcpu *vcpu)
 {
 	u32 eb;
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
 
 	eb = (1u << PF_VECTOR) | (1u << UD_VECTOR) | (1u << MC_VECTOR) |
 	     (1u << NM_VECTOR) | (1u << DB_VECTOR);
@@ -1304,6 +1305,12 @@ static void update_exception_bitmap(struct kvm_vcpu *vcpu)
 	 */
 	if (is_guest_mode(vcpu))
 		eb |= get_vmcs12(vcpu)->exception_bitmap;
+
+	/* When in non-injection ELI mode, NP exceptions occur on external
+	 * interrupts not assigned to the guest, so should cause an exit.
+	 */
+	if (vmx->eli.enabled && !vmx->eli.inject_mode)
+		eb |= 1u << NP_VECTOR;
 
 	vmcs_write32(EXCEPTION_BITMAP, eb);
 }
@@ -4305,6 +4312,9 @@ static void eli_set_inject_mode(struct vcpu_vmx *vmx, bool inject_mode) {
 	vmcs_writel(GUEST_IDTR_BASE, idt->address);
 	vmcs_write32(PIN_BASED_VM_EXEC_CONTROL,	pin_based_exec_ctrl);
 	vmcs_write32(SECONDARY_VM_EXEC_CONTROL, cpu_based_2nd_exec_ctrl);
+
+	/* Trap or don't trap NP exceptions, depending on injection mode */
+	update_exception_bitmap(&vmx->vcpu);
 }
 
 static void vmx_inject_irq(struct kvm_vcpu *vcpu)
