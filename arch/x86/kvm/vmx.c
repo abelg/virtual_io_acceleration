@@ -5426,6 +5426,40 @@ static void pvpi_release_descriptor(struct vcpu_vmx *vmx) {
 	kvm_release_page_dirty(shared_page);
 	return;
 }
+/* Enable or disable exitless virtual interrupt injection, using paravirtual
+ * posted interrupts.
+ */
+static int enable_exitless_injection(struct vcpu_vmx *vmx, bool enabled) {
+	struct kvm_vcpu *vcpu;
+	int i;
+	bool setup_idt;
+	
+	if (!vmx->posted_interrupts.notif_vector_gpa) {
+		return 0;
+	}
+
+	if (vmx->posted_interrupts.enabled == enabled) {
+		return 0;
+	}
+
+	setup_idt = true;
+	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
+		if (to_vmx(vcpu)->posted_interrupts.enabled &&
+				vcpu != &vmx->vcpu) {
+			setup_idt = false;
+			break;
+		}
+	}
+	
+	if (setup_idt) {		
+		eli_copy_idt_entry(vmx, POSTED_INTERRUPT_VECTOR, POSTED_INTERRUPT_VECTOR, !enabled /* true to set not present, false to set present */);
+	}
+	
+	vmx->posted_interrupts.enabled = enabled;
+	*(vmx->posted_interrupts.shared_descriptor) = -1;
+	return 1;
+}
+
 /* Paravirtual posted interrupts send an IPI to the core running a certain
  * guest, intending that it will be handled in this guest (without exit).
  * However, in some rare cases an unrelated exit occurs, and the IPI arrives
@@ -5762,6 +5796,8 @@ static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 #define DI_START_EOI             1101
 #define DI_STOP_EOI              1201
 #define PI_INITIALIZE            2000
+#define PI_START                 2100
+#define PI_STOP                  2200
 
 static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 {
@@ -5802,6 +5838,12 @@ static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 		pvpi_init(vmx,
 			(gva_t)kvm_register_read(vcpu, VCPU_REGS_RBX),
 			(gva_t)kvm_register_read(vcpu, VCPU_REGS_RCX));
+		break;
+	case PI_START:
+		enable_exitless_injection(vmx, true);
+		break;
+	case PI_STOP:
+		enable_exitless_injection(vmx, false);			
 		break;
 	default:
 		return 0; /* hypercall was not handled here */
