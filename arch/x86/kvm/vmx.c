@@ -88,6 +88,9 @@ module_param(fasteoi, bool, S_IRUGO);
 
 static bool __read_mostly enable_apicv_reg_vid;
 
+static unsigned int __read_mostly preempt_timer = 2.93*1000*1000*1000*0.005;
+module_param(preempt_timer, uint, 0644);
+
 /*
  * If nested=1, nested virtualization is supported, i.e., guests may use
  * VMX and be a hypervisor for its own guests. If nested=0, guests may not
@@ -4345,6 +4348,7 @@ static void eli_set_inject_mode(struct vcpu_vmx *vmx, bool inject_mode) {
 		idt = &vmx->eli.guest_idt;
 		/* Enable exit on external interrupts */
 		pin_based_exec_ctrl |= PIN_BASED_EXT_INTR_MASK;
+		pin_based_exec_ctrl &= ~PIN_BASED_VMX_PREEMPTION_TIMER;
 		/* No need to trap changes in the IDTR register */
 		cpu_based_2nd_exec_ctrl &= ~SECONDARY_EXEC_DESC_TABLE_EXITING;
 	} else {
@@ -4353,6 +4357,7 @@ static void eli_set_inject_mode(struct vcpu_vmx *vmx, bool inject_mode) {
 		/* Disable exit on external interrupts,
 		   (interrupts are delivered through the shadow idt) */
 		pin_based_exec_ctrl &= ~PIN_BASED_EXT_INTR_MASK;
+		pin_based_exec_ctrl |= PIN_BASED_VMX_PREEMPTION_TIMER;
 		/* Trap any attempt of the guest to change the IDTR register */
 		cpu_based_2nd_exec_ctrl |= SECONDARY_EXEC_DESC_TABLE_EXITING;
 	}
@@ -5487,6 +5492,14 @@ static int handle_ldtr_tr(struct kvm_vcpu *vcpu) {
 	       vcpu->vcpu_id);
 	eli_set_inject_mode(to_vmx(vcpu), true);
 	
+	return 1;
+}
+
+/* Handle vmx preemption timer used to force exits if the guest disabled
+ interrupts for a long period of time */
+static int handle_timer_expired(struct kvm_vcpu *vcpu) {
+	printk(KERN_WARNING "kvm-eli: vmx timer expired for vcpu=%d!\n",
+	       vcpu->vcpu_id);
 	return 1;
 }
 
@@ -6649,6 +6662,7 @@ static int (*const kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_MONITOR_INSTRUCTION]     = handle_invalid_op,
 	[EXIT_REASON_GDTR_IDTR]		      = handle_gdtr_idtr,
 	[EXIT_REASON_LDTR_TR]		      = handle_ldtr_tr,
+	[EXIT_REASON_TIMER_EXPIRED]           = handle_timer_expired,
 };
 
 static const int kvm_vmx_max_exit_handlers =
@@ -7256,6 +7270,9 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 					vmcs12->idt_vectoring_error_code);
 		}
 	}
+	/* reset preemption timer if needed */
+	if (vmx->eli.enabled && !vmx->eli.inject_mode)
+		vmcs_write32(VMX_PREEMPTION_TIMER, preempt_timer);
 
 	/* Record the guest's net vcpu time for enforced NMI injections. */
 	if (unlikely(!cpu_has_virtual_nmis() && vmx->soft_vnmi_blocked))
