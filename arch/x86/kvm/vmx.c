@@ -432,6 +432,10 @@ struct vcpu_vmx {
 
 	/* Support for a guest hypervisor (nested VMX) */
 	struct nested_vmx nested;
+	/* we need to change the x2apic msr bitmaps per vcpu thus
+	 * we can't use global bitmaps */
+	unsigned long *vmx_msr_bitmap_legacy_x2apic;
+	unsigned long *vmx_msr_bitmap_longmode_x2apic;
 
 	/* Support for Exit-Less Interrupts (ELI) */
 	struct {
@@ -448,6 +452,9 @@ struct vcpu_vmx {
 		gpa_t host_idt_gpa;
 		/* Indicates if ELI is enabled or not */
 		bool enabled;
+		/* Indicates if the exit-less EOI feature of ELI is enabled
+		 * too. This requires x2APIC. */
+		bool exitless_eoi;
 		/* Enabled when we need to temporarily run the guest with its
 		 * original IDT, so we can inject a virtual interrupt.
 		 */
@@ -673,8 +680,6 @@ static unsigned long *vmx_io_bitmap_a;
 static unsigned long *vmx_io_bitmap_b;
 static unsigned long *vmx_msr_bitmap_legacy;
 static unsigned long *vmx_msr_bitmap_longmode;
-static unsigned long *vmx_msr_bitmap_legacy_x2apic;
-static unsigned long *vmx_msr_bitmap_longmode_x2apic;
 
 static bool cpu_has_load_ia32_efer;
 static bool cpu_has_load_perf_global_ctrl;
@@ -1887,9 +1892,9 @@ static void vmx_set_msr_bitmap(struct kvm_vcpu *vcpu)
 
 	if (irqchip_in_kernel(vcpu->kvm) && apic_x2apic_mode(vcpu->arch.apic)) {
 		if (is_long_mode(vcpu))
-			msr_bitmap = vmx_msr_bitmap_longmode_x2apic;
+			msr_bitmap = to_vmx(vcpu)->vmx_msr_bitmap_longmode_x2apic;
 		else
-			msr_bitmap = vmx_msr_bitmap_legacy_x2apic;
+			msr_bitmap = to_vmx(vcpu)->vmx_msr_bitmap_legacy_x2apic;
 	} else {
 		if (is_long_mode(vcpu))
 			msr_bitmap = vmx_msr_bitmap_longmode;
@@ -3903,27 +3908,36 @@ static void vmx_disable_intercept_for_msr(u32 msr, bool longmode_only)
 						msr, MSR_TYPE_R | MSR_TYPE_W);
 }
 
-static void vmx_enable_intercept_msr_read_x2apic(u32 msr)
+static void vmx_enable_intercept_msr_read_x2apic(struct vcpu_vmx *vmx, u32 msr)
 {
-	__vmx_enable_intercept_for_msr(vmx_msr_bitmap_legacy_x2apic,
+ 	__vmx_enable_intercept_for_msr(vmx->vmx_msr_bitmap_legacy_x2apic,
 			msr, MSR_TYPE_R);
-	__vmx_enable_intercept_for_msr(vmx_msr_bitmap_longmode_x2apic,
+	__vmx_enable_intercept_for_msr(vmx->vmx_msr_bitmap_longmode_x2apic,
 			msr, MSR_TYPE_R);
 }
 
-static void vmx_disable_intercept_msr_read_x2apic(u32 msr)
-{
-	__vmx_disable_intercept_for_msr(vmx_msr_bitmap_legacy_x2apic,
-			msr, MSR_TYPE_R);
-	__vmx_disable_intercept_for_msr(vmx_msr_bitmap_longmode_x2apic,
-			msr, MSR_TYPE_R);
-}
 
-static void vmx_disable_intercept_msr_write_x2apic(u32 msr)
+static void vmx_enable_intercept_msr_write_x2apic(struct vcpu_vmx *vmx, u32 msr)
 {
-	__vmx_disable_intercept_for_msr(vmx_msr_bitmap_legacy_x2apic,
+	__vmx_enable_intercept_for_msr(vmx->vmx_msr_bitmap_legacy_x2apic,
 			msr, MSR_TYPE_W);
-	__vmx_disable_intercept_for_msr(vmx_msr_bitmap_longmode_x2apic,
+	__vmx_enable_intercept_for_msr(vmx->vmx_msr_bitmap_longmode_x2apic,
+			msr, MSR_TYPE_W);
+}
+
+static void vmx_disable_intercept_msr_read_x2apic(struct vcpu_vmx *vmx, u32 msr)
+{
+	__vmx_disable_intercept_for_msr(vmx->vmx_msr_bitmap_legacy_x2apic,
+			msr, MSR_TYPE_R);
+	__vmx_disable_intercept_for_msr(vmx->vmx_msr_bitmap_longmode_x2apic,
+			msr, MSR_TYPE_R);
+}
+
+static void vmx_disable_intercept_msr_write_x2apic(struct vcpu_vmx *vmx, u32 msr)
+{
+	__vmx_disable_intercept_for_msr(vmx->vmx_msr_bitmap_legacy_x2apic,
+			msr, MSR_TYPE_W);
+	__vmx_disable_intercept_for_msr(vmx->vmx_msr_bitmap_longmode_x2apic,
 			msr, MSR_TYPE_W);
 }
 
@@ -4294,6 +4308,20 @@ static void enable_nmi_window(struct kvm_vcpu *vcpu)
 	vmcs_write32(CPU_BASED_VM_EXEC_CONTROL, cpu_based_vm_exec_control);
 }
 
+/* Enables or disables exits on guest use of the EOI MSR. ELI changes this
+ * back and forth to allow a guest to acknowledge assigned interrupts without
+ * exit, while forcing an exit when acknowledging virtual interrupts.
+ * This, obviously, only works if x2APIC is available (this function will never
+ * be called if it isn't).
+ */
+#define EOI_MSR (APIC_BASE_MSR + (APIC_EOI >> 4)) /* 0x80b */
+static inline void eli_eoi_exiting(struct vcpu_vmx *vmx, bool exiting) {
+	if (exiting)
+		vmx_enable_intercept_msr_write_x2apic(vmx, EOI_MSR);
+	else
+		vmx_disable_intercept_msr_write_x2apic(vmx, EOI_MSR);
+}
+
 /* Enables or disables ELI's injection mode. When injection mode is disabled
  * the guest runs with normal ELI: the shadow IDT is used, and the CPU is
  * configured to deliver interrupts directly into the guest without exit.
@@ -4336,6 +4364,9 @@ static void eli_set_inject_mode(struct vcpu_vmx *vmx, bool inject_mode) {
 
 	/* Trap or don't trap NP exceptions, depending on injection mode */
 	update_exception_bitmap(&vmx->vcpu);
+	/* allow direct EOI access only if we don't run in injection mode */
+	if (vmx->eli.exitless_eoi)
+		eli_eoi_exiting(vmx, inject_mode);
 }
 
 static void vmx_inject_irq(struct kvm_vcpu *vcpu)
@@ -5446,6 +5477,9 @@ static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 }
 
 #define DI_INITIALIZE             300
+/* hypercalls used to start/stop ExitLess interrupt completion (EOI) */
+#define DI_START_EOI             1101
+#define DI_STOP_EOI              1201
 
 static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 {
@@ -5455,6 +5489,23 @@ static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 	case DI_INITIALIZE:
 		eli_init_all(vmx,
 			(gva_t) kvm_register_read(&vmx->vcpu, VCPU_REGS_RBX));
+		break;
+	case DI_START_EOI:
+		/* enable ExitLess interrupt completion */
+		if (!irqchip_in_kernel(vcpu->kvm) ||
+			!apic_x2apic_mode(vcpu->arch.apic)) {
+			printk(KERN_WARNING "kvm-eli: Can't enable Exitless EOI: no x2APIC\n");
+		} else {
+			vmx->eli.exitless_eoi = true;
+			eli_eoi_exiting(vmx, vmx->eli.inject_mode);
+		}
+		break;
+	case DI_STOP_EOI:
+		/* disable ExitLess interrupt completion */
+		if (vmx->eli.exitless_eoi) {
+			eli_eoi_exiting(vmx, true);
+			vmx->eli.exitless_eoi = false;
+		}
 		break;
 	default:
 		return 0; /* hypercall was not handled here */
@@ -6857,8 +6908,8 @@ static void vmx_set_virtual_x2apic_mode(struct kvm_vcpu *vcpu, bool set)
 	 * There is not point to enable virtualize x2apic without enable
 	 * apicv
 	 */
-	if (!cpu_has_vmx_virtualize_x2apic_mode() ||
-				!vmx_vm_has_apicv(vcpu->kvm))
+	/* the comment above is not true for exitless eoi */
+	if (!cpu_has_vmx_virtualize_x2apic_mode())
 		return;
 
 	if (!vm_need_tpr_shadow(vcpu->kvm))
@@ -7299,6 +7350,8 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	free_page((unsigned long)vmx->vmx_msr_bitmap_legacy_x2apic);
+	free_page((unsigned long)vmx->vmx_msr_bitmap_longmode_x2apic);
 
 	free_vpid(vmx);
 	free_nested(vmx);
@@ -7313,6 +7366,7 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
 	int err;
 	struct vcpu_vmx *vmx = kmem_cache_zalloc(kvm_vcpu_cache, GFP_KERNEL);
 	int cpu;
+	int msr;
 
 	if (!vmx)
 		return ERR_PTR(-ENOMEM);
@@ -7328,11 +7382,41 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
 	if (!vmx->guest_msrs) {
 		goto uninit_vcpu;
 	}
+	vmx->vmx_msr_bitmap_legacy_x2apic = (unsigned long *)__get_free_page(GFP_KERNEL);
+	if (!vmx->vmx_msr_bitmap_legacy_x2apic) {
+		goto free_msrs;
+	}		
+	vmx->vmx_msr_bitmap_longmode_x2apic = (unsigned long *)__get_free_page(GFP_KERNEL);
+	if (!vmx->vmx_msr_bitmap_longmode_x2apic) {
+		goto free_x2apic_legacy_bitmap;
+	}
+	memcpy(vmx->vmx_msr_bitmap_legacy_x2apic,
+			vmx_msr_bitmap_legacy, PAGE_SIZE);
+	memcpy(vmx->vmx_msr_bitmap_longmode_x2apic,
+			vmx_msr_bitmap_longmode, PAGE_SIZE);
+
+	if (enable_apicv_reg_vid) {
+		for (msr = 0x800; msr <= 0x8ff; msr++)
+			vmx_disable_intercept_msr_read_x2apic(vmx, msr);
+
+		/* According SDM, in x2apic mode, the whole id reg is used.
+		 * But in KVM, it only use the highest eight bits. Need to
+		 * intercept it */
+		vmx_enable_intercept_msr_read_x2apic(vmx, 0x802);
+		/* TMCCT */
+		vmx_enable_intercept_msr_read_x2apic(vmx, 0x839);
+		/* TPR */
+		vmx_disable_intercept_msr_write_x2apic(vmx, 0x808);
+		/* EOI */
+		vmx_disable_intercept_msr_write_x2apic(vmx, 0x80b);
+		/* SELF-IPI */
+		vmx_disable_intercept_msr_write_x2apic(vmx, 0x83f);
+	}
 
 	vmx->loaded_vmcs = &vmx->vmcs01;
 	vmx->loaded_vmcs->vmcs = alloc_vmcs();
 	if (!vmx->loaded_vmcs->vmcs)
-		goto free_msrs;
+		goto free_x2apic_long_bitmap;
 	if (!vmm_exclusive)
 		kvm_cpu_vmxon(__pa(per_cpu(vmxarea, raw_smp_processor_id())));
 	loaded_vmcs_init(vmx->loaded_vmcs);
@@ -7373,6 +7457,10 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
 
 free_vmcs:
 	free_loaded_vmcs(vmx->loaded_vmcs);
+free_x2apic_long_bitmap:
+	free_page((unsigned long)vmx->vmx_msr_bitmap_legacy_x2apic);
+free_x2apic_legacy_bitmap:
+	free_page((unsigned long)vmx->vmx_msr_bitmap_longmode_x2apic);
 free_msrs:
 	kfree(vmx->guest_msrs);
 uninit_vcpu:
@@ -8240,7 +8328,7 @@ static struct kvm_x86_ops vmx_x86_ops = {
 
 static int __init vmx_init(void)
 {
-	int r, i, msr;
+	int r, i;
 
 	rdmsrl_safe(MSR_EFER, &host_efer);
 
@@ -8261,19 +8349,11 @@ static int __init vmx_init(void)
 	if (!vmx_msr_bitmap_legacy)
 		goto out1;
 
-	vmx_msr_bitmap_legacy_x2apic =
-				(unsigned long *)__get_free_page(GFP_KERNEL);
-	if (!vmx_msr_bitmap_legacy_x2apic)
-		goto out2;
 
 	vmx_msr_bitmap_longmode = (unsigned long *)__get_free_page(GFP_KERNEL);
 	if (!vmx_msr_bitmap_longmode)
 		goto out3;
 
-	vmx_msr_bitmap_longmode_x2apic =
-				(unsigned long *)__get_free_page(GFP_KERNEL);
-	if (!vmx_msr_bitmap_longmode_x2apic)
-		goto out4;
 
 	/*
 	 * Allow direct access to the PC debug port (it is often used for I/O
@@ -8305,28 +8385,7 @@ static int __init vmx_init(void)
 	vmx_disable_intercept_for_msr(MSR_IA32_SYSENTER_CS, false);
 	vmx_disable_intercept_for_msr(MSR_IA32_SYSENTER_ESP, false);
 	vmx_disable_intercept_for_msr(MSR_IA32_SYSENTER_EIP, false);
-	memcpy(vmx_msr_bitmap_legacy_x2apic,
-			vmx_msr_bitmap_legacy, PAGE_SIZE);
-	memcpy(vmx_msr_bitmap_longmode_x2apic,
-			vmx_msr_bitmap_longmode, PAGE_SIZE);
 
-	if (enable_apicv_reg_vid) {
-		for (msr = 0x800; msr <= 0x8ff; msr++)
-			vmx_disable_intercept_msr_read_x2apic(msr);
-
-		/* According SDM, in x2apic mode, the whole id reg is used.
-		 * But in KVM, it only use the highest eight bits. Need to
-		 * intercept it */
-		vmx_enable_intercept_msr_read_x2apic(0x802);
-		/* TMCCT */
-		vmx_enable_intercept_msr_read_x2apic(0x839);
-		/* TPR */
-		vmx_disable_intercept_msr_write_x2apic(0x808);
-		/* EOI */
-		vmx_disable_intercept_msr_write_x2apic(0x80b);
-		/* SELF-IPI */
-		vmx_disable_intercept_msr_write_x2apic(0x83f);
-	}
 
 	if (enable_ept) {
 		kvm_mmu_set_mask_ptes(0ull,
@@ -8340,11 +8399,7 @@ static int __init vmx_init(void)
 
 	return 0;
 
-out4:
-	free_page((unsigned long)vmx_msr_bitmap_longmode);
 out3:
-	free_page((unsigned long)vmx_msr_bitmap_legacy_x2apic);
-out2:
 	free_page((unsigned long)vmx_msr_bitmap_legacy);
 out1:
 	free_page((unsigned long)vmx_io_bitmap_b);
@@ -8355,8 +8410,6 @@ out:
 
 static void __exit vmx_exit(void)
 {
-	free_page((unsigned long)vmx_msr_bitmap_legacy_x2apic);
-	free_page((unsigned long)vmx_msr_bitmap_longmode_x2apic);
 	free_page((unsigned long)vmx_msr_bitmap_legacy);
 	free_page((unsigned long)vmx_msr_bitmap_longmode);
 	free_page((unsigned long)vmx_io_bitmap_b);
